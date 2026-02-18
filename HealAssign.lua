@@ -41,9 +41,15 @@ local CLASS_DISPLAY = {
 -------------------------------------------------------------------------------
 -- SAVED VARIABLES DEFAULT
 -------------------------------------------------------------------------------
-HealAssignDB = HealAssignDB or {}
-
+-------------------------------------------------------------------------------
+-- SAVED VARIABLES DEFAULT
+-- NOTE: Do NOT pre-initialize HealAssignDB here.
+-- In WoW 1.12, SavedVariables are nil until VARIABLES_LOADED fires.
+-- InitDB() is called from the VARIABLES_LOADED event handler.
+-------------------------------------------------------------------------------
 local function InitDB()
+    -- Ensure the global exists (in case called before VARIABLES_LOADED)
+    if not HealAssignDB then HealAssignDB = {} end
     if not HealAssignDB.templates then HealAssignDB.templates = {} end
     if not HealAssignDB.activeTemplate then HealAssignDB.activeTemplate = nil end
     if not HealAssignDB.options then
@@ -577,7 +583,7 @@ local function RebuildMainRows()
         addHealerBtn:SetHeight(18)
         addHealerBtn:SetPoint("LEFT", targetLabel, "RIGHT", 5, 0)
         addHealerBtn:SetText("Add Healer")
-        addHealerBtn:SetNormalFontObject(GameFontNormalSmall)
+        --addHealerBtn:SetNormalFontObject(GameFontNormalSmall)
 
         local capturedTI = ti
         addHealerBtn:SetScript("OnClick", function()
@@ -611,7 +617,7 @@ local function RebuildMainRows()
         removeTargetBtn:SetHeight(18)
         removeTargetBtn:SetPoint("RIGHT", targetRow, "RIGHT", -2, 0)
         removeTargetBtn:SetText("X")
-        removeTargetBtn:SetNormalFontObject(GameFontNormalSmall)
+        --removeTargetBtn:SetNormalFontObject(GameFontNormalSmall)
         local capturedTI2 = ti
         removeTargetBtn:SetScript("OnClick", function()
             table.remove(currentTemplate.targets, capturedTI2)
@@ -650,13 +656,17 @@ local function RebuildMainRows()
             removeHealerBtn:SetHeight(16)
             removeHealerBtn:SetPoint("RIGHT", healerRow, "RIGHT", -2, 0)
             removeHealerBtn:SetText("X")
-            removeHealerBtn:SetNormalFontObject(GameFontNormalSmall)
-            local capturedTI3 = ti
-            local capturedHI = hi
+            
+            -- Fix: Use direct local variables for the closure to ensure correct indexing
+            local targetIndex = ti
+            local healerIndex = hi
+            
             removeHealerBtn:SetScript("OnClick", function()
-                table.remove(currentTemplate.targets[capturedTI3].healers, capturedHI)
-                SaveCurrentTemplate()
-                RebuildMainRows()
+                if currentTemplate and currentTemplate.targets[targetIndex] then
+                    table.remove(currentTemplate.targets[targetIndex].healers, healerIndex)
+                    SaveCurrentTemplate()
+                    RebuildMainRows()
+                end
             end)
 
             yOffset = yOffset - (ROW_H - 4)
@@ -708,37 +718,55 @@ local function CreateMainFrame()
         CloseDropdown()
     end)
 
-    -- Row 1: Template name + load/new
+-------------------------------------------------------------------------------
+    -- Row 1: Template name + Save/Load/Delete (Perfect Centering)
+    -------------------------------------------------------------------------------
     local nameLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    nameLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -42)
+    -- Centering based on the whole row width (~336px). 
+    -- We anchor to TOP and move left by 168px to start the row.
+    nameLabel:SetPoint("TOP", f, "TOP", -145, -42) 
     nameLabel:SetText("Template:")
 
     local nameEdit = CreateFrame("EditBox", "HealAssignNameEdit", f, "InputBoxTemplate")
-    nameEdit:SetWidth(180)
+    nameEdit:SetWidth(100) -- Reduced width as requested
     nameEdit:SetHeight(20)
     nameEdit:SetPoint("LEFT", nameLabel, "RIGHT", 5, 0)
     nameEdit:SetAutoFocus(false)
     nameEdit:SetMaxLetters(64)
-    nameEdit:SetText(currentTemplate and currentTemplate.name or "New Template")
-    nameEdit:SetScript("OnEnterPressed", function()
-        this:ClearFocus()
-        if currentTemplate then
-            local oldName = currentTemplate.name
-            local newName = this:GetText()
-            if newName ~= "" and newName ~= oldName then
-                HealAssignDB.templates[oldName] = nil
-                currentTemplate.name = newName
-                SaveCurrentTemplate()
-            end
-        end
-    end)
+    nameEdit:SetText("") 
     f.nameEdit = nameEdit
 
-    -- Load template button
+    -- Save button
+    local saveBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    saveBtn:SetWidth(50)
+    saveBtn:SetHeight(20)
+    saveBtn:SetPoint("LEFT", nameEdit, "RIGHT", 8, 0)
+    saveBtn:SetText("Save")
+    saveBtn:SetScript("OnClick", function()
+        local name = f.nameEdit:GetText()
+        if not name or name == "" then
+            DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Enter a template name first.")
+            return
+        end
+        
+        if not currentTemplate then
+            currentTemplate = NewTemplate(name)
+        else
+            if currentTemplate.name ~= name then
+                HealAssignDB.templates[currentTemplate.name] = nil
+                currentTemplate.name = name
+            end
+        end
+        SaveCurrentTemplate()
+        DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Template '"..name.."' saved.")
+        RebuildMainRows()
+    end)
+
+    -- Load button
     local loadBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    loadBtn:SetWidth(80)
+    loadBtn:SetWidth(50)
     loadBtn:SetHeight(20)
-    loadBtn:SetPoint("LEFT", nameEdit, "RIGHT", 8, 0)
+    loadBtn:SetPoint("LEFT", saveBtn, "RIGHT", 4, 0)
     loadBtn:SetText("Load")
     loadBtn:SetScript("OnClick", function()
         local items = {}
@@ -759,46 +787,41 @@ local function CreateMainFrame()
         end, 180)
     end)
 
-    -- New template button
-    local newBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    newBtn:SetWidth(55)
-    newBtn:SetHeight(20)
-    newBtn:SetPoint("LEFT", loadBtn, "RIGHT", 4, 0)
-    newBtn:SetText("New")
-    newBtn:SetScript("OnClick", function()
-        local name = f.nameEdit:GetText()
-        if not name or name == "" then name = "Template" end
-        currentTemplate = NewTemplate(name)
-        SaveCurrentTemplate()
-        RebuildMainRows()
-    end)
-
-    -- Delete template button
+    -- Delete button
     local delTmplBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
     delTmplBtn:SetWidth(55)
     delTmplBtn:SetHeight(20)
-    delTmplBtn:SetPoint("LEFT", newBtn, "RIGHT", 4, 0)
+    delTmplBtn:SetPoint("LEFT", loadBtn, "RIGHT", 4, 0)
     delTmplBtn:SetText("Delete")
     delTmplBtn:SetScript("OnClick", function()
         if currentTemplate then
             HealAssignDB.templates[currentTemplate.name] = nil
             HealAssignDB.activeTemplate = nil
             currentTemplate = nil
-            f.nameEdit:SetText("New Template")
+            f.nameEdit:SetText("")
             RebuildMainRows()
+            DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Template deleted.")
         end
     end)
 
-    -- Row 2: Toolbar buttons
+-------------------------------------------------------------------------------
+    -- Row 2: Toolbar buttons (Centered via TOP anchor)
+    -------------------------------------------------------------------------------
     local toolY = -68
     local btnH = 22
     local btnSpacing = 4
+    
+    -- The total width of all buttons + spacing is 428px.
+    -- To center it, the first button must start at -(428/2) + (first_button_width/2)
+    -- Calculation: -214 + 44 = -170
+    local startOffset = -170
 
     -- Add Tank
     local addTankBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
     addTankBtn:SetWidth(88)
     addTankBtn:SetHeight(btnH)
-    addTankBtn:SetPoint("TOPLEFT", f, "TOPLEFT", 12, toolY)
+    -- We anchor to "TOP" (center) instead of "TOPLEFT"
+    addTankBtn:SetPoint("TOP", f, "TOP", startOffset, toolY)
     addTankBtn:SetText("Add Tank")
     addTankBtn:SetScript("OnClick", function()
         if not currentTemplate then
@@ -813,7 +836,6 @@ local function CreateMainFrame()
                 table.insert(items, {text=m.name, name=m.name, class=m.class, r=r, g=g, b=b})
             end
         end
-        -- If no tank-class members found, show all
         if table.getn(items) == 0 then
             for _, m in ipairs(members) do
                 local r, g, b = GetClassColor(m.class)
@@ -836,6 +858,7 @@ local function CreateMainFrame()
     local addGroupBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
     addGroupBtn:SetWidth(88)
     addGroupBtn:SetHeight(btnH)
+    -- Anchor to the right of the previous button
     addGroupBtn:SetPoint("LEFT", addTankBtn, "RIGHT", btnSpacing, 0)
     addGroupBtn:SetText("Add Group")
     addGroupBtn:SetScript("OnClick", function()
@@ -992,7 +1015,7 @@ local function CreateOptionsFrame()
         local cb = CreateFrame("CheckButton", "HealAssignCB_"..cls, f, "UICheckButtonTemplate")
         cb:SetWidth(cbH)
         cb:SetHeight(cbH)
-        local col = (i-1) % cbPerRow
+        local col = math.mod(i-1, cbPerRow)
         local row = math.floor((i-1) / cbPerRow)
         cb:SetPoint("TOPLEFT", f, "TOPLEFT", cbX + col * cbW, cbY - row * (cbH + 2))
 
@@ -1064,8 +1087,9 @@ local function CreateOptionsFrame()
     addCustomBtn:SetPoint("LEFT", customEdit, "RIGHT", 5, 0)
     addCustomBtn:SetText("Add")
 
-    -- Custom targets list
+-- Custom targets list
     local customListFrame = CreateFrame("Frame", nil, f)
+    -- Back to original -280 vertical offset
     customListFrame:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -280)
     customListFrame:SetWidth(330)
     customListFrame:SetHeight(110)
@@ -1073,10 +1097,13 @@ local function CreateOptionsFrame()
     f.customListFrame = customListFrame
 
     local function RefreshCustomList()
+        -- Safely hide old rows
         for _, r in ipairs(customListFrame.rows) do r:Hide() end
         customListFrame.rows = {}
 
-        for i, ct in ipairs(HealAssignDB.options.customTargets) do
+        local targets = HealAssignDB.options.customTargets
+        for i = 1, table.getn(targets) do
+            local ct = targets[i]
             local row = CreateFrame("Frame", nil, customListFrame)
             row:SetHeight(18)
             row:SetPoint("TOPLEFT", customListFrame, "TOPLEFT", 0, -(i-1)*18)
@@ -1093,10 +1120,11 @@ local function CreateOptionsFrame()
             delBtn:SetHeight(16)
             delBtn:SetPoint("RIGHT", row, "RIGHT", -2, 0)
             delBtn:SetText("X")
-            delBtn:SetNormalFontObject(GameFontNormalSmall)
-            local capturedI = i
+            
+            -- Keep the working deletion fix with local index
+            local indexToRemove = i
             delBtn:SetScript("OnClick", function()
-                table.remove(HealAssignDB.options.customTargets, capturedI)
+                table.remove(HealAssignDB.options.customTargets, indexToRemove)
                 RefreshCustomList()
             end)
         end
@@ -1168,7 +1196,7 @@ function HealAssign_SyncTemplate()
     -- WoW 1.12 SendAddonMessage limit is 255 chars
     local CHUNK_SIZE = 200
     local totalLen = string.len(data)
-    local numChunks = math.ceil(totalLen / CHUNK_SIZE)
+    local numChunks = math.floor((totalLen + CHUNK_SIZE - 1) / CHUNK_SIZE)
     if numChunks < 1 then numChunks = 1 end
 
     for i = 1, numChunks do
