@@ -425,9 +425,14 @@ local function UpdateAssignFrame()
     local myName = UnitName("player")
     local content = assignFrame.content
 
+    -- Set the font size from options dynamically
+    local fontSize = (HealAssignDB.options and HealAssignDB.options.fontSize) or 12
+    content:SetFont("Fonts\\FRIZQT__.TTF", fontSize, "OUTLINE")
+
     local tmpl = GetActiveTemplate()
     if not tmpl then
         content:SetText("|cff888888No active template.|r")
+        assignFrame:SetHeight(50)
         return
     end
 
@@ -466,9 +471,11 @@ local function UpdateAssignFrame()
 
     content:SetText(table.concat(lines, "\n"))
 
-    -- Resize frame to fit content
+    -- Calculate height based on actual font size and number of lines
     local numLines = table.getn(lines)
-    local newH = 22 + numLines * 14 + 10
+    local lineSpacing = fontSize + 4
+    local newH = 20 + (numLines * lineSpacing) + 10
+    
     if newH < 50 then newH = 50 end
     assignFrame:SetHeight(newH)
 end
@@ -500,17 +507,22 @@ local function CreateAssignFrame()
     title:SetText("My Assignments")
 
     local content = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    content:SetPoint("TOPLEFT", f, "TOPLEFT", 8, -18)
-    content:SetPoint("TOPRIGHT", f, "TOPRIGHT", -8, -18)
+    content:SetPoint("TOPLEFT", f, "TOPLEFT", 8, -20) -- Slightly lower to clear title
+    content:SetPoint("TOPRIGHT", f, "TOPRIGHT", -8, -20)
     content:SetJustifyH("LEFT")
     content:SetJustifyV("TOP")
+    
+    -- Apply the font size immediately on creation
+    local fontSize = (HealAssignDB.options and HealAssignDB.options.fontSize) or 12
+    content:SetFont("Fonts\\FRIZQT__.TTF", fontSize, "OUTLINE")
     content:SetText("|cff888888Waiting for sync...|r")
+    
     f.content = content
-
     assignFrame = f
 
     if HealAssignDB.options and HealAssignDB.options.showAssignFrame then
         f:Show()
+        UpdateAssignFrame() -- Initial update
     else
         f:Hide()
     end
@@ -965,7 +977,7 @@ local function CreateMainFrame()
 end
 
 -------------------------------------------------------------------------------
--- OPTIONS FRAME
+-- OPTIONS FRAME (Updated with fixed font slider and spacing)
 -------------------------------------------------------------------------------
 local function CreateOptionsFrame()
     if optionsFrame then
@@ -975,7 +987,7 @@ local function CreateOptionsFrame()
 
     local f = CreateFrame("Frame", "HealAssignOptionsFrame", UIParent)
     f:SetWidth(370)
-    f:SetHeight(440)
+    f:SetHeight(560) 
     f:SetPoint("TOPLEFT", UIParent, "CENTER", 20, 100)
     f:SetMovable(true)
     f:EnableMouse(true)
@@ -1055,28 +1067,53 @@ local function CreateOptionsFrame()
         local val = tonumber(this:GetText())
         if val then HealAssignDB.options.chatChannel = val end
     end)
-    f.chanEdit = chanEdit
 
     local chanNote = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     chanNote:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -205)
     chanNote:SetTextColor(0.55, 0.55, 0.55)
-    chanNote:SetText("Set to 0 to disable. Posts: 'PlayerName (tank/healer) dead - assigned: ...'")
+    chanNote:SetText("Set to 0 to disable. Posts: 'PlayerName (tank/healer) dead'")
+
+    -- Section: Font Size
+    local secFont = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    secFont:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -230) -- Adjusted position
+    secFont:SetTextColor(1, 0.8, 0.2)
+    secFont:SetText("Assignments Font Size:")
+
+    local fontSlider = CreateFrame("Slider", "HealAssignFontSlider", f, "OptionsSliderTemplate")
+    fontSlider:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -260) -- Added more space below title
+    fontSlider:SetWidth(200)
+    fontSlider:SetHeight(16)
+    fontSlider:SetMinMaxValues(8, 24)
+    fontSlider:SetValueStep(1)
+    fontSlider:SetValue(HealAssignDB.options.fontSize or 12)
+
+    getglobal(fontSlider:GetName().."Text"):SetText("Size: " .. (HealAssignDB.options.fontSize or 12))
+    getglobal(fontSlider:GetName().."Low"):SetText("8")
+    getglobal(fontSlider:GetName().."High"):SetText("24")
+
+    fontSlider:SetScript("OnValueChanged", function()
+        local val = math.floor(this:GetValue())
+        HealAssignDB.options.fontSize = val
+        getglobal(this:GetName().."Text"):SetText("Size: " .. val)
+        -- Trigger immediate update of the assignments display
+        if UpdateAssignFrame then UpdateAssignFrame() end
+    end)
 
     -- Section: Custom Targets
     local sec3 = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    sec3:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -222)
+    sec3:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -300) -- Shifted down
     sec3:SetTextColor(1, 0.8, 0.2)
     sec3:SetText("Custom Assignment Targets:")
 
     local customNote = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    customNote:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -238)
+    customNote:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -317)
     customNote:SetTextColor(0.55, 0.55, 0.55)
     customNote:SetText("e.g. 'Main Tank', 'OT Mark', 'Skull Target'")
 
     local customEdit = CreateFrame("EditBox", "HealAssignCustomEdit", f, "InputBoxTemplate")
     customEdit:SetWidth(210)
     customEdit:SetHeight(20)
-    customEdit:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -255)
+    customEdit:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -335)
     customEdit:SetAutoFocus(false)
     customEdit:SetMaxLetters(64)
     customEdit:SetText("")
@@ -1087,20 +1124,17 @@ local function CreateOptionsFrame()
     addCustomBtn:SetPoint("LEFT", customEdit, "RIGHT", 5, 0)
     addCustomBtn:SetText("Add")
 
--- Custom targets list
+    -- Custom targets list
     local customListFrame = CreateFrame("Frame", nil, f)
-    -- Back to original -280 vertical offset
-    customListFrame:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -280)
+    customListFrame:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -360)
     customListFrame:SetWidth(330)
-    customListFrame:SetHeight(110)
+    customListFrame:SetHeight(120)
     customListFrame.rows = {}
     f.customListFrame = customListFrame
 
     local function RefreshCustomList()
-        -- Safely hide old rows
         for _, r in ipairs(customListFrame.rows) do r:Hide() end
         customListFrame.rows = {}
-
         local targets = HealAssignDB.options.customTargets
         for i = 1, table.getn(targets) do
             local ct = targets[i]
@@ -1121,10 +1155,9 @@ local function CreateOptionsFrame()
             delBtn:SetPoint("RIGHT", row, "RIGHT", -2, 0)
             delBtn:SetText("X")
             
-            -- Keep the working deletion fix with local index
-            local indexToRemove = i
+            local idx = i
             delBtn:SetScript("OnClick", function()
-                table.remove(HealAssignDB.options.customTargets, indexToRemove)
+                table.remove(HealAssignDB.options.customTargets, idx)
                 RefreshCustomList()
             end)
         end
@@ -1144,15 +1177,12 @@ local function CreateOptionsFrame()
     local showAssignCB = CreateFrame("CheckButton", "HealAssignShowAssignCB", f, "UICheckButtonTemplate")
     showAssignCB:SetWidth(20)
     showAssignCB:SetHeight(20)
-    showAssignCB:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -398)
+    showAssignCB:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -520)
     showAssignCB:SetChecked(HealAssignDB.options.showAssignFrame)
     showAssignCB:SetScript("OnClick", function()
         HealAssignDB.options.showAssignFrame = this:GetChecked()
         if HealAssignDB.options.showAssignFrame then
-            if assignFrame then
-                assignFrame:Show()
-                UpdateAssignFrame()
-            end
+            if assignFrame then assignFrame:Show(); UpdateAssignFrame() end
         else
             if assignFrame then assignFrame:Hide() end
         end
@@ -1169,7 +1199,6 @@ end
 -------------------------------------------------------------------------------
 -- SYNC / COMMUNICATION
 -------------------------------------------------------------------------------
--- Incoming message buffer for chunked messages
 local incomingChunks = {}
 
 function HealAssign_SyncTemplate()
@@ -1178,62 +1207,69 @@ function HealAssign_SyncTemplate()
         DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r No active template to sync.")
         return
     end
+    
     local data = Serialize(tmpl)
     if not data then
         DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Failed to serialize template.")
         return
     end
 
+    -- Escape characters that cause "Invalid escape code" in WoW 1.12.1
+    data = string.gsub(data, "%%", "{perc}")
+    data = string.gsub(data, "\\", "{bs}")
+    data = string.gsub(data, "|", "{pipe}")
+
     local channel = "RAID"
     if GetNumRaidMembers() == 0 then
         channel = "PARTY"
         if GetNumPartyMembers() == 0 then
-            DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Not in a group. Sync only works in party/raid.")
+            DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Not in a group.")
             return
         end
     end
 
-    -- WoW 1.12 SendAddonMessage limit is 255 chars
-    local CHUNK_SIZE = 200
+    local CHUNK_SIZE = 150 
     local totalLen = string.len(data)
-    local numChunks = math.floor((totalLen + CHUNK_SIZE - 1) / CHUNK_SIZE)
+    local numChunks = math.ceil(totalLen / CHUNK_SIZE)
     if numChunks < 1 then numChunks = 1 end
 
     for i = 1, numChunks do
-        local chunk = string.sub(data, (i-1)*CHUNK_SIZE + 1, i*CHUNK_SIZE)
-        local msg = "SYNC:"..i..":"..numChunks..":"..chunk
+        local startPos = (i-1) * CHUNK_SIZE + 1
+        local endPos = i * CHUNK_SIZE
+        local chunk = string.sub(data, startPos, endPos)
+        
+        -- Using semicolon separator to avoid chat parser confusion
+        local msg = "S;"..i..";"..numChunks..";"..chunk
         SendAddonMessage(COMM_PREFIX, msg, channel)
     end
 
-    DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Template '"..tmpl.name.."' synced to "..channel.." ("..numChunks.." packet(s)).")
+    -- Update own frame immediately after syncing
     UpdateAssignFrame()
+    
+    DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Template '"..tmpl.name.."' synced.")
 end
 
 local function HandleAddonMessage(prefix, msg, channel, sender)
     if prefix ~= COMM_PREFIX then return end
-    local myName = UnitName("player")
-    if sender == myName then return end
+    if sender == UnitName("player") then return end
 
-    -- SYNC:chunkIdx:totalChunks:data
-    -- In Lua 5.0 (WoW 1.12), string.find returns: startPos, endPos, cap1, cap2, ...
-    local s, e, ci, tc, d = string.find(msg, "^SYNC:(%d+):(%d+):(.+)$")
-    if not s then return end
-    local chunkIdx = tonumber(ci)
-    local totalChunks = tonumber(tc)
+    -- Parse S;index;total;data format
+    local _, _, cIdx, tChunks, d = string.find(msg, "^S;(%d+);(%d+);(.+)$")
+    if not cIdx then return end
+    
+    local chunkIdx = tonumber(cIdx)
+    local totalChunks = tonumber(tChunks)
     local data = d
 
-    if not incomingChunks[sender] then
-        incomingChunks[sender] = {total=totalChunks, chunks={}}
+    if not incomingChunks[sender] or incomingChunks[sender].total ~= totalChunks then
+        incomingChunks[sender] = {total = totalChunks, chunks = {}}
     end
-    -- Reset if new sync started
-    if incomingChunks[sender].total ~= totalChunks then
-        incomingChunks[sender] = {total=totalChunks, chunks={}}
-    end
+    
     incomingChunks[sender].chunks[chunkIdx] = data
 
     -- Check if all chunks received
     local allReceived = true
-    for i = 1, incomingChunks[sender].total do
+    for i = 1, totalChunks do
         if not incomingChunks[sender].chunks[i] then
             allReceived = false
             break
@@ -1242,24 +1278,24 @@ local function HandleAddonMessage(prefix, msg, channel, sender)
 
     if allReceived then
         local fullData = ""
-        for i = 1, incomingChunks[sender].total do
+        for i = 1, totalChunks do
             fullData = fullData .. incomingChunks[sender].chunks[i]
         end
         incomingChunks[sender] = nil
+
+        -- Restore escaped characters
+        fullData = string.gsub(fullData, "{perc}", "%%")
+        fullData = string.gsub(fullData, "{bs}", "\\")
+        fullData = string.gsub(fullData, "{pipe}", "|")
 
         local tmpl = Deserialize(fullData)
         if tmpl then
             HealAssignDB.templates[tmpl.name] = tmpl
             HealAssignDB.activeTemplate = tmpl.name
             currentTemplate = tmpl
-            DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Received template '"..tmpl.name.."' from "..sender..".")
-            if mainFrame and mainFrame:IsShown() then
-                mainFrame.nameEdit:SetText(tmpl.name)
-                RebuildMainRows()
-            end
+            DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Received '"..tmpl.name.."' from "..sender)
+            if mainFrame and mainFrame:IsShown() then RebuildMainRows() end
             UpdateAssignFrame()
-        else
-            DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Failed to parse template from "..sender..".")
         end
     end
 end
@@ -1281,13 +1317,11 @@ deathFrame:SetScript("OnEvent", function()
     local tmpl = GetActiveTemplate()
     if not tmpl then return end
 
-    -- Extract dead player name
-    -- WoW 1.12 messages: "PlayerName dies." or "You die."
+    -- Extract dead player name (WoW 1.12.1 pattern)
     local deadName = nil
     if msg == "You die." then
         deadName = UnitName("player")
     else
-        -- Lua 5.0: string.find returns startPos, endPos, cap1, ...
         local s, e, cap = string.find(msg, "^(.+) dies%.$")
         if s then deadName = cap end
     end
