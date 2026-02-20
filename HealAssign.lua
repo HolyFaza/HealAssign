@@ -1239,22 +1239,23 @@ local function CreateOptionsFrame()
     sec2:SetText("Death Notification Channel:")
 
     local chanEdit = CreateFrame("EditBox", "HealAssignChanEdit", f, "InputBoxTemplate")
-    chanEdit:SetWidth(50)
+    chanEdit:SetWidth(150)
     chanEdit:SetHeight(20)
     chanEdit:SetPoint("LEFT", sec2, "RIGHT", 8, 0)
     chanEdit:SetAutoFocus(false)
     chanEdit:SetMaxLetters(3)
-    chanEdit:SetNumeric(true)
-    chanEdit:SetText(tostring(HealAssignDB.options.chatChannel or 1))
+    chanEdit:SetNumeric(false)
+    chanEdit:SetText(tostring(HealAssignDB.options.chatChannel or ""))
     chanEdit:SetScript("OnEnterPressed", function()
-        this:ClearFocus()
-        local val = tonumber(this:GetText())
-        if val then HealAssignDB.options.chatChannel = val end
-    end)
-    chanEdit:SetScript("OnEditFocusLost", function()
-        local val = tonumber(this:GetText())
-        if val then HealAssignDB.options.chatChannel = val end
-    end)
+    this:ClearFocus()
+    local val = this:GetText()
+    if val and val ~= "" then HealAssignDB.options.chatChannel = val end
+end)
+chanEdit:SetScript("OnEditFocusLost", function()
+    local val = this:GetText()
+    if val and val ~= "" then HealAssignDB.options.chatChannel = val end
+end)
+
 
     local chanNote = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     chanNote:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -205)
@@ -1614,7 +1615,9 @@ deathFrame:SetScript("OnEvent", function()
     local msg = arg1
     if not msg then return end
 
-    local channel = HealAssignDB and HealAssignDB.options and HealAssignDB.options.chatChannel
+    local channelName = HealAssignDB and HealAssignDB.options and HealAssignDB.options.chatChannel
+    if not channelName or channelName == "" or channelName == "0" then return end
+    local channel = GetChannelName(channelName)
     if not channel or channel == 0 then return end
 
     local tmpl = GetActiveTemplate()
