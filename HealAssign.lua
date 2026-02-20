@@ -6,7 +6,7 @@
 -- CONSTANTS & CLASS COLORS
 -------------------------------------------------------------------------------
 local ADDON_NAME = "HealAssign"
-local ADDON_VERSION = "1.0.3"
+local ADDON_VERSION = "1.0.4"
 local COMM_PREFIX = "HealAssign"
 
 local CLASS_COLORS = {
@@ -696,12 +696,15 @@ local function RebuildMainRows()
         addHealerBtn:SetScript("OnClick", function()
             local members = GetRaidMembers()
             local items = {}
+            local HEALER_CLASSES = {PRIEST=true, DRUID=true, SHAMAN=true, PALADIN=true}
             for _, m in ipairs(members) do
-                local r, g, b = GetClassColor(m.class)
-                table.insert(items, {text=m.name, name=m.name, class=m.class, r=r, g=g, b=b})
+                if HEALER_CLASSES[m.class] then
+                    local r, g, b = GetClassColor(m.class)
+                    table.insert(items, {text=m.name, name=m.name, class=m.class, r=r, g=g, b=b})
+                end
             end
             if table.getn(items) == 0 then
-                table.insert(items, {text="(No raid members)", name=nil, r=0.5,g=0.5,b=0.5})
+                table.insert(items, {text="(No healers in raid)", name=nil, r=0.5,g=0.5,b=0.5})
             end
             ShowDropdown(addHealerBtn, items, function(item)
                 if item.name then
