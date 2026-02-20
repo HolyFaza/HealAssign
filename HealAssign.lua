@@ -39,6 +39,23 @@ local CLASS_DISPLAY = {
 }
 
 -------------------------------------------------------------------------------
+-- UTILITY: DEEP COPY (global, no 'local', so StaticPopupDialogs can call it)
+-------------------------------------------------------------------------------
+function DeepCopy(orig)
+    local t = type(orig)
+    local copy
+    if t == 'table' then
+        copy = {}
+        for k, v in pairs(orig) do
+            copy[DeepCopy(k)] = DeepCopy(v)
+        end
+    else
+        copy = orig
+    end
+    return copy
+end
+
+-------------------------------------------------------------------------------
 -- SAVED VARIABLES DEFAULT
 -------------------------------------------------------------------------------
 -------------------------------------------------------------------------------
@@ -48,10 +65,12 @@ local CLASS_DISPLAY = {
 -- InitDB() is called from the VARIABLES_LOADED event handler.
 -------------------------------------------------------------------------------
 local function InitDB()
-    -- Ensure the global exists (in case called before VARIABLES_LOADED)
+    -- Ensure the global exists
     if not HealAssignDB then HealAssignDB = {} end
     if not HealAssignDB.templates then HealAssignDB.templates = {} end
     if not HealAssignDB.activeTemplate then HealAssignDB.activeTemplate = nil end
+    
+    -- Default Options
     if not HealAssignDB.options then
         HealAssignDB.options = {
             tankClasses = {
@@ -62,25 +81,78 @@ local function InitDB()
             customTargets = {},
             chatChannel = 1,
             showAssignFrame = true,
+            fontSize = 12,
         }
     end
-    if not HealAssignDB.options.customTargets then
-        HealAssignDB.options.customTargets = {}
-    end
-    if not HealAssignDB.options.chatChannel then
-        HealAssignDB.options.chatChannel = 1
-    end
-    if HealAssignDB.options.showAssignFrame == nil then
-        HealAssignDB.options.showAssignFrame = true
-    end
+
+    -- Safety checks
+    if not HealAssignDB.options.customTargets then HealAssignDB.options.customTargets = {} end
+    if not HealAssignDB.options.chatChannel then HealAssignDB.options.chatChannel = 1 end
+    if HealAssignDB.options.showAssignFrame == nil then HealAssignDB.options.showAssignFrame = true end
+    if not HealAssignDB.options.fontSize then HealAssignDB.options.fontSize = 12 end
     if not HealAssignDB.options.tankClasses then
         HealAssignDB.options.tankClasses = {
             ["WARRIOR"] = true,
             ["DRUID"]   = true,
-            ["PALADIN"] = true,
+            ["SHAMAN"] = true,
         }
     end
+
+    -- Dialog 1: Confirm Delete
+    StaticPopupDialogs["HEALASSIGN_CONFIRM_DELETE"] = {
+        text = "Are you sure you want to delete template '%s'?",
+        button1 = "Yes",
+        button2 = "No",
+        OnAccept = function()
+            local name = HealAssignNameEdit:GetText()
+            if name and HealAssignDB.templates[name] then
+                HealAssignDB.templates[name] = nil
+                HealAssignDB.activeTemplate = nil
+                currentTemplate = { name = "", targets = {} }
+                HealAssignNameEdit:SetText("")
+                RebuildMainRows()
+                UpdateAssignFrame()
+                DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Template '"..name.."' deleted.")
+            end
+        end,
+        timeout = 0,
+        whileDead = true,
+        hideOnEscape = true,
+    }
+
+    -- Dialog 2: Save before New
+    StaticPopupDialogs["HEALASSIGN_SAVE_BEFORE_NEW"] = {
+        text = "Current template has unsaved changes. Save before creating a new one?",
+        button1 = "Save",
+        button2 = "Cancel",
+        OnAccept = function()
+            local name = HealAssignNameEdit:GetText()
+            -- If name field is empty, warn and do NOT proceed
+            if not name or name == "" then
+                DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Please enter a template name before saving.")
+                return
+            end
+            -- Save current template (same logic as the SAVE button in row 1)
+            if not currentTemplate then currentTemplate = { name = name, targets = {} } end
+            currentTemplate.name = name
+            HealAssignDB.templates[name] = DeepCopy(currentTemplate)
+            HealAssignDB.activeTemplate = name
+            DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Template '"..name.."' saved.")
+            -- Now clear everything for the new blank template
+            currentTemplate = { name = "", targets = {} }
+            HealAssignDB.activeTemplate = nil
+            HealAssignNameEdit:SetText("")
+            RebuildMainRows()
+            UpdateAssignFrame()
+        end,
+        OnCancel = function()
+        end,
+        timeout = 0,
+        whileDead = true,
+        hideOnEscape = true,
+    }
 end
+
 
 -------------------------------------------------------------------------------
 -- UTILITY FUNCTIONS
@@ -307,7 +379,7 @@ local assignFrame = nil
 local dropdownFrame = nil
 local activeDropdown = nil
 
-local currentTemplate = nil
+currentTemplate = nil       -- global: must be accessible from StaticPopupDialogs
 local templateRows = {}
 
 -------------------------------------------------------------------------------
@@ -320,8 +392,38 @@ local function CloseDropdown()
     activeDropdown = nil
 end
 
+-- Global variables for dropdown control
+local lastDropdownCloseTime = 0
+local activeDropdownAnchor = nil
+
+local function CloseDropdown()
+    if dropdownFrame and dropdownFrame:IsShown() then
+        dropdownFrame:Hide()
+        if dropdownLocker then dropdownLocker:Hide() end
+        lastDropdownCloseTime = GetTime()
+        activeDropdownAnchor = nil
+    end
+end
+
 local function ShowDropdown(anchorFrame, items, onSelect, width)
+    -- Toggle logic: if clicking the same button that opened it, just close and exit
+    if dropdownFrame and dropdownFrame:IsShown() and activeDropdownAnchor == anchorFrame then
+        CloseDropdown()
+        return
+    end
+
+    -- If another dropdown is open, close it first
     CloseDropdown()
+
+    -- Create locker to detect clicks outside
+    if not dropdownLocker then
+        dropdownLocker = CreateFrame("Button", "HealAssignDropdownLocker", UIParent)
+        dropdownLocker:SetAllPoints(UIParent)
+        dropdownLocker:SetFrameStrata("BACKGROUND")
+        dropdownLocker:SetScript("OnClick", function()
+            CloseDropdown()
+        end)
+    end
 
     if not dropdownFrame then
         dropdownFrame = CreateFrame("Frame", "HealAssignDropdownFrame", UIParent)
@@ -337,6 +439,9 @@ local function ShowDropdown(anchorFrame, items, onSelect, width)
     end
 
     local f = dropdownFrame
+    activeDropdownAnchor = anchorFrame
+    dropdownLocker:Show()
+
     -- Hide all existing buttons
     for _, b in ipairs(f.buttons) do
         b:Hide()
@@ -391,6 +496,7 @@ local function ShowDropdown(anchorFrame, items, onSelect, width)
     activeDropdown = f
 end
 
+
 -------------------------------------------------------------------------------
 -- TEMPLATE MANAGEMENT
 -------------------------------------------------------------------------------
@@ -418,7 +524,7 @@ end
 -------------------------------------------------------------------------------
 -- ASSIGNMENT DISPLAY FRAME (healer's personal view)
 -------------------------------------------------------------------------------
-local function UpdateAssignFrame()
+function UpdateAssignFrame()
     if not assignFrame then return end
     if not assignFrame:IsShown() then return end
 
@@ -536,7 +642,7 @@ local MAIN_H = 500
 local ROW_H = 22
 local INDENT_HEALER = 20
 
-local function RebuildMainRows()
+function RebuildMainRows()
     for _, row in ipairs(templateRows) do
         row:Hide()
     end
@@ -616,7 +722,7 @@ local function RebuildMainRows()
                     end
                     if not already then
                         table.insert(currentTemplate.targets[capturedTI].healers, item.name)
-                        SaveCurrentTemplate()
+                        --SaveCurrentTemplate()
                         RebuildMainRows()
                     end
                 end
@@ -633,7 +739,7 @@ local function RebuildMainRows()
         local capturedTI2 = ti
         removeTargetBtn:SetScript("OnClick", function()
             table.remove(currentTemplate.targets, capturedTI2)
-            SaveCurrentTemplate()
+            --SaveCurrentTemplate()
             RebuildMainRows()
         end)
 
@@ -676,7 +782,7 @@ local function RebuildMainRows()
             removeHealerBtn:SetScript("OnClick", function()
                 if currentTemplate and currentTemplate.targets[targetIndex] then
                     table.remove(currentTemplate.targets[targetIndex].healers, healerIndex)
-                    SaveCurrentTemplate()
+                    --SaveCurrentTemplate()
                     RebuildMainRows()
                 end
             end)
@@ -731,90 +837,166 @@ local function CreateMainFrame()
     end)
 
 -------------------------------------------------------------------------------
-    -- Row 1: Template name + Save/Load/Delete (Perfect Centering)
-    -------------------------------------------------------------------------------
-    local nameLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    -- Centering based on the whole row width (~336px). 
-    -- We anchor to TOP and move left by 168px to start the row.
-    nameLabel:SetPoint("TOP", f, "TOP", -145, -42) 
-    nameLabel:SetText("Template:")
+-- ROW 1: NEW / LOAD / SAVE / RESET / DELETE
+-------------------------------------------------------------------------------
 
-    local nameEdit = CreateFrame("EditBox", "HealAssignNameEdit", f, "InputBoxTemplate")
-    nameEdit:SetWidth(100) -- Reduced width as requested
-    nameEdit:SetHeight(20)
-    nameEdit:SetPoint("LEFT", nameLabel, "RIGHT", 5, 0)
-    nameEdit:SetAutoFocus(false)
-    nameEdit:SetMaxLetters(64)
-    nameEdit:SetText("") 
-    f.nameEdit = nameEdit
+-- (DeepCopy is defined at the top of the file in global scope)
 
-    -- Save button
-    local saveBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    saveBtn:SetWidth(50)
-    saveBtn:SetHeight(20)
-    saveBtn:SetPoint("LEFT", nameEdit, "RIGHT", 8, 0)
-    saveBtn:SetText("Save")
-    saveBtn:SetScript("OnClick", function()
-        local name = f.nameEdit:GetText()
-        if not name or name == "" then
-            DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Enter a template name first.")
-            return
+-- Helper to check if current workspace differs from the saved database entry
+local function IsCurrentTemplateDirty()
+    if not currentTemplate or table.getn(currentTemplate.targets) == 0 then 
+        return false 
+    end
+    
+    local name = f.nameEdit:GetText()
+    local saved = HealAssignDB.templates[name]
+    
+    if not saved then return true end
+    
+    if table.getn(currentTemplate.targets) ~= table.getn(saved.targets) then
+        return true
+    end
+    
+    for i, target in ipairs(currentTemplate.targets) do
+        local sTarget = saved.targets[i]
+        if not sTarget or target.value ~= sTarget.value or target.type ~= sTarget.type then 
+            return true 
         end
         
-        if not currentTemplate then
-            currentTemplate = NewTemplate(name)
-        else
-            if currentTemplate.name ~= name then
-                HealAssignDB.templates[currentTemplate.name] = nil
-                currentTemplate.name = name
-            end
+        if table.getn(target.healers) ~= table.getn(sTarget.healers) then 
+            return true 
         end
-        SaveCurrentTemplate()
-        DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Template '"..name.."' saved.")
-        RebuildMainRows()
-    end)
+        
+        for j, healer in ipairs(target.healers) do
+            if healer ~= sTarget.healers[j] then return true end
+        end
+    end
+    
+    return false
+end
 
-    -- Load button
-    local loadBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    loadBtn:SetWidth(50)
-    loadBtn:SetHeight(20)
-    loadBtn:SetPoint("LEFT", saveBtn, "RIGHT", 4, 0)
-    loadBtn:SetText("Load")
-    loadBtn:SetScript("OnClick", function()
-        local items = {}
-        for tname, _ in pairs(HealAssignDB.templates) do
-            table.insert(items, {text=tname, name=tname, r=1,g=0.9,b=0.5})
-        end
-        table.sort(items, function(a,b) return a.text < b.text end)
-        if table.getn(items) == 0 then
-            table.insert(items, {text="(No saved templates)", name=nil, r=0.5,g=0.5,b=0.5})
-        end
-        ShowDropdown(loadBtn, items, function(item)
-            if item.name then
-                currentTemplate = HealAssignDB.templates[item.name]
-                HealAssignDB.activeTemplate = item.name
-                f.nameEdit:SetText(currentTemplate.name)
-                RebuildMainRows()
-            end
-        end, 180)
+-- Helper for tooltips
+local function AddTooltip(frame, text)
+    frame:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(frame, "ANCHOR_RIGHT")
+        GameTooltip:SetText(text, 1, 1, 1, 1, true)
+        GameTooltip:Show()
     end)
+    frame:SetScript("OnLeave", function() GameTooltip:Hide() end)
+end
 
-    -- Delete button
-    local delTmplBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    delTmplBtn:SetWidth(55)
-    delTmplBtn:SetHeight(20)
-    delTmplBtn:SetPoint("LEFT", loadBtn, "RIGHT", 4, 0)
-    delTmplBtn:SetText("Delete")
-    delTmplBtn:SetScript("OnClick", function()
-        if currentTemplate then
-            HealAssignDB.templates[currentTemplate.name] = nil
-            HealAssignDB.activeTemplate = nil
-            currentTemplate = nil
-            f.nameEdit:SetText("")
-            RebuildMainRows()
-            DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Template deleted.")
+local nameLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+nameLabel:SetPoint("TOP", f, "TOP", -155, -42) 
+nameLabel:SetText("Template:")
+
+local nameEdit = CreateFrame("EditBox", "HealAssignNameEdit", f, "InputBoxTemplate")
+nameEdit:SetWidth(80)
+nameEdit:SetHeight(20)
+nameEdit:SetPoint("LEFT", nameLabel, "RIGHT", 5, 0)
+nameEdit:SetAutoFocus(false)
+nameEdit:SetMaxLetters(64)
+f.nameEdit = nameEdit
+
+-- 1. NEW (Updated with IsCurrentTemplateDirty check)
+local newBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+newBtn:SetWidth(36)
+newBtn:SetHeight(20)
+newBtn:SetPoint("LEFT", nameEdit, "RIGHT", 5, 0)
+newBtn:SetText("New")
+AddTooltip(newBtn, "Clear workspace and name to start a fresh template.")
+newBtn:SetScript("OnClick", function()
+    if IsCurrentTemplateDirty() then
+        StaticPopup_Show("HEALASSIGN_SAVE_BEFORE_NEW")
+    else
+        currentTemplate = { name = "", targets = {} }
+        HealAssignDB.activeTemplate = nil
+        f.nameEdit:SetText("")
+        if type(RebuildMainRows) == "function" then RebuildMainRows() end
+        if type(UpdateAssignFrame) == "function" then UpdateAssignFrame() end
+    end
+end)
+
+-- 2. LOAD
+local loadBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+loadBtn:SetWidth(40)
+loadBtn:SetHeight(20)
+loadBtn:SetPoint("LEFT", newBtn, "RIGHT", 3, 0)
+loadBtn:SetText("Load")
+AddTooltip(loadBtn, "Load an existing template. Click again to close menu.")
+loadBtn:SetScript("OnClick", function()
+    local items = {}
+    for tname, _ in pairs(HealAssignDB.templates) do
+        table.insert(items, {text=tname, name=tname, r=1,g=0.9,b=0.5})
+    end
+    table.sort(items, function(a,b) return a.text < b.text end)
+    
+    if table.getn(items) == 0 then
+        table.insert(items, {text="(No templates)", name=nil, r=0.5,g=0.5,b=0.5})
+    end
+    
+    ShowDropdown(loadBtn, items, function(item)
+        if item.name then
+            currentTemplate = DeepCopy(HealAssignDB.templates[item.name])
+            HealAssignDB.activeTemplate = item.name
+            f.nameEdit:SetText(currentTemplate.name)
+            if type(RebuildMainRows) == "function" then RebuildMainRows() end
+            if type(UpdateAssignFrame) == "function" then UpdateAssignFrame() end
         end
-    end)
+    end, 180)
+end)
+
+-- 3. SAVE
+local saveBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+saveBtn:SetWidth(40)
+saveBtn:SetHeight(20)
+saveBtn:SetPoint("LEFT", loadBtn, "RIGHT", 3, 0)
+saveBtn:SetText("Save")
+AddTooltip(saveBtn, "Save current assignments to the database.")
+saveBtn:SetScript("OnClick", function()
+    local name = f.nameEdit:GetText()
+    if not name or name == "" then
+        DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Enter a name first.")
+        return
+    end
+    if not currentTemplate then currentTemplate = { name = name, targets = {} } end
+    currentTemplate.name = name
+    HealAssignDB.templates[name] = DeepCopy(currentTemplate)
+    HealAssignDB.activeTemplate = name
+    DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r '"..name.."' saved.")
+    if type(RebuildMainRows) == "function" then RebuildMainRows() end
+end)
+
+-- 4. RESET
+local resetBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+resetBtn:SetWidth(42)
+resetBtn:SetHeight(20)
+resetBtn:SetPoint("LEFT", saveBtn, "RIGHT", 3, 0)
+resetBtn:SetText("Reset")
+AddTooltip(resetBtn, "Clear all assignments but keep the template name.")
+resetBtn:SetScript("OnClick", function()
+    if currentTemplate then
+        currentTemplate.targets = {}
+        if type(RebuildMainRows) == "function" then RebuildMainRows() end
+        if type(UpdateAssignFrame) == "function" then UpdateAssignFrame() end
+        DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Assignments reset.")
+    end
+end)
+
+-- 5. DELETE
+local delBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+delBtn:SetWidth(32)
+delBtn:SetHeight(20)
+delBtn:SetPoint("LEFT", resetBtn, "RIGHT", 3, 0)
+delBtn:SetText("Del")
+AddTooltip(delBtn, "Permanently delete this template.")
+delBtn:SetScript("OnClick", function()
+    local name = f.nameEdit:GetText()
+    if name and name ~= "" and HealAssignDB.templates[name] then
+        StaticPopup_Show("HEALASSIGN_CONFIRM_DELETE", name)
+    else
+        DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Invalid template.")
+    end
+end)
 
 -------------------------------------------------------------------------------
     -- Row 2: Toolbar buttons (Centered via TOP anchor)
@@ -860,7 +1042,7 @@ local function CreateMainFrame()
         ShowDropdown(addTankBtn, items, function(item)
             if item.name then
                 table.insert(currentTemplate.targets, {type="tank", value=item.name, healers={}})
-                SaveCurrentTemplate()
+                -- SaveCurrentTemplate() removed to prevent silent auto-save
                 RebuildMainRows()
             end
         end, 180)
@@ -884,7 +1066,7 @@ local function CreateMainFrame()
         end
         ShowDropdown(addGroupBtn, items, function(item)
             table.insert(currentTemplate.targets, {type="group", value=item.value, healers={}})
-            SaveCurrentTemplate()
+            -- SaveCurrentTemplate() removed to prevent silent auto-save
             RebuildMainRows()
         end, 120)
     end)
@@ -910,7 +1092,7 @@ local function CreateMainFrame()
         ShowDropdown(addCustomBtn, items, function(item)
             if item.value then
                 table.insert(currentTemplate.targets, {type="custom", value=item.value, healers={}})
-                SaveCurrentTemplate()
+                -- SaveCurrentTemplate() removed to prevent silent auto-save
                 RebuildMainRows()
             end
         end, 210)
