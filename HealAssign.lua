@@ -6,7 +6,7 @@
 -- CONSTANTS & CLASS COLORS
 -------------------------------------------------------------------------------
 local ADDON_NAME = "HealAssign"
-local ADDON_VERSION = "1.0.0"
+local ADDON_VERSION = "1.0.3"
 local COMM_PREFIX = "HealAssign"
 
 local CLASS_COLORS = {
@@ -39,23 +39,6 @@ local CLASS_DISPLAY = {
 }
 
 -------------------------------------------------------------------------------
--- UTILITY: DEEP COPY (global, no 'local', so StaticPopupDialogs can call it)
--------------------------------------------------------------------------------
-function DeepCopy(orig)
-    local t = type(orig)
-    local copy
-    if t == 'table' then
-        copy = {}
-        for k, v in pairs(orig) do
-            copy[DeepCopy(k)] = DeepCopy(v)
-        end
-    else
-        copy = orig
-    end
-    return copy
-end
-
--------------------------------------------------------------------------------
 -- SAVED VARIABLES DEFAULT
 -------------------------------------------------------------------------------
 -------------------------------------------------------------------------------
@@ -76,10 +59,10 @@ local function InitDB()
             tankClasses = {
                 ["WARRIOR"] = true,
                 ["DRUID"]   = true,
-                ["SHAMAN"] = true,
+                ["PALADIN"] = true,
             },
             customTargets = {},
-            chatChannel = 1,
+            chatChannel = "",
             showAssignFrame = true,
             fontSize = 12,
         }
@@ -87,7 +70,7 @@ local function InitDB()
 
     -- Safety checks
     if not HealAssignDB.options.customTargets then HealAssignDB.options.customTargets = {} end
-    if not HealAssignDB.options.chatChannel then HealAssignDB.options.chatChannel = 1 end
+    if not HealAssignDB.options.chatChannel then HealAssignDB.options.chatChannel = "" end
     if HealAssignDB.options.showAssignFrame == nil then HealAssignDB.options.showAssignFrame = true end
     if not HealAssignDB.options.fontSize then HealAssignDB.options.fontSize = 12 end
     if not HealAssignDB.options.tankClasses then
@@ -107,11 +90,16 @@ local function InitDB()
             local name = HealAssignNameEdit:GetText()
             if name and HealAssignDB.templates[name] then
                 HealAssignDB.templates[name] = nil
-                HealAssignDB.activeTemplate = nil
-                currentTemplate = { name = "", targets = {} }
-                HealAssignNameEdit:SetText("")
-                RebuildMainRows()
-                UpdateAssignFrame()
+                
+                if HealAssignDB.activeTemplate == name or (currentTemplate and currentTemplate.name == name) then
+                    HealAssignDB.activeTemplate = nil
+                    currentTemplate = { name = "", targets = {} }
+                    HealAssignNameEdit:SetText("")
+                end
+                
+                -- Check for function existence before calling to avoid nil errors
+                if type(RebuildMainRows) == "function" then RebuildMainRows() end
+                if type(UpdateAssignFrame) == "function" then UpdateAssignFrame() end
                 DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Template '"..name.."' deleted.")
             end
         end,
@@ -124,28 +112,29 @@ local function InitDB()
     StaticPopupDialogs["HEALASSIGN_SAVE_BEFORE_NEW"] = {
         text = "Current template has unsaved changes. Save before creating a new one?",
         button1 = "Save",
-        button2 = "Cancel",
+        button2 = "Discard",
         OnAccept = function()
             local name = HealAssignNameEdit:GetText()
-            -- If name field is empty, warn and do NOT proceed
-            if not name or name == "" then
-                DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Please enter a template name before saving.")
-                return
+            if name and name ~= "" then
+                -- Note: DeepCopy must be global or defined before InitDB to work here
+                if type(DeepCopy) == "function" then
+                    HealAssignDB.templates[name] = DeepCopy(currentTemplate)
+                    HealAssignDB.activeTemplate = name
+                    DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Template '"..name.."' saved.")
+                end
             end
-            -- Save current template (same logic as the SAVE button in row 1)
-            if not currentTemplate then currentTemplate = { name = name, targets = {} } end
-            currentTemplate.name = name
-            HealAssignDB.templates[name] = DeepCopy(currentTemplate)
-            HealAssignDB.activeTemplate = name
-            DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Template '"..name.."' saved.")
-            -- Now clear everything for the new blank template
             currentTemplate = { name = "", targets = {} }
             HealAssignDB.activeTemplate = nil
             HealAssignNameEdit:SetText("")
-            RebuildMainRows()
-            UpdateAssignFrame()
+            if type(RebuildMainRows) == "function" then RebuildMainRows() end
+            if type(UpdateAssignFrame) == "function" then UpdateAssignFrame() end
         end,
         OnCancel = function()
+            currentTemplate = { name = "", targets = {} }
+            HealAssignDB.activeTemplate = nil
+            HealAssignNameEdit:SetText("")
+            if type(RebuildMainRows) == "function" then RebuildMainRows() end
+            if type(UpdateAssignFrame) == "function" then UpdateAssignFrame() end
         end,
         timeout = 0,
         whileDead = true,
@@ -379,7 +368,7 @@ local assignFrame = nil
 local dropdownFrame = nil
 local activeDropdown = nil
 
-currentTemplate = nil       -- global: must be accessible from StaticPopupDialogs
+local currentTemplate = nil
 local templateRows = {}
 
 -------------------------------------------------------------------------------
@@ -524,7 +513,7 @@ end
 -------------------------------------------------------------------------------
 -- ASSIGNMENT DISPLAY FRAME (healer's personal view)
 -------------------------------------------------------------------------------
-function UpdateAssignFrame()
+local function UpdateAssignFrame()
     if not assignFrame then return end
     if not assignFrame:IsShown() then return end
 
@@ -642,7 +631,7 @@ local MAIN_H = 500
 local ROW_H = 22
 local INDENT_HEALER = 20
 
-function RebuildMainRows()
+local function RebuildMainRows()
     for _, row in ipairs(templateRows) do
         row:Hide()
     end
@@ -832,13 +821,7 @@ local function CreateMainFrame()
     local closeBtn = CreateFrame("Button", nil, f, "UIPanelCloseButton")
     closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -4, -4)
     closeBtn:SetScript("OnClick", function()
-        ReleaseEditorLock()
         f:Hide()
-        CloseDropdown()
-    end)
-    -- Also release lock if frame is hidden by any other means
-    f:SetScript("OnHide", function()
-        ReleaseEditorLock()
         CloseDropdown()
     end)
 
@@ -846,7 +829,21 @@ local function CreateMainFrame()
 -- ROW 1: NEW / LOAD / SAVE / RESET / DELETE
 -------------------------------------------------------------------------------
 
--- (DeepCopy is defined at the top of the file in global scope)
+-- Helper for deep copying tables
+local function DeepCopy(orig)
+    local orig_type = type(orig)
+    local copy
+    if orig_type == 'table' then
+        copy = {}
+        for orig_key, orig_value in next, orig, nil do
+            copy[DeepCopy(orig_key)] = DeepCopy(orig_value)
+        end
+        setmetatable(copy, DeepCopy(getmetatable(orig)))
+    else
+        copy = orig
+    end
+    return copy
+end
 
 -- Helper to check if current workspace differs from the saved database entry
 local function IsCurrentTemplateDirty()
@@ -857,21 +854,26 @@ local function IsCurrentTemplateDirty()
     local name = f.nameEdit:GetText()
     local saved = HealAssignDB.templates[name]
     
+    -- If no saved template exists but workspace has targets, it's dirty
     if not saved then return true end
     
+    -- Compare name of template
+    if currentTemplate.name ~= saved.name then return true end
+    
+    -- Compare number of targets
     if table.getn(currentTemplate.targets) ~= table.getn(saved.targets) then
         return true
     end
     
+    -- Deep comparison of targets and their healers
     for i, target in ipairs(currentTemplate.targets) do
         local sTarget = saved.targets[i]
-        if not sTarget or target.value ~= sTarget.value or target.type ~= sTarget.type then 
-            return true 
-        end
+        -- FIX: Changed .name to .value and added .type check
+        if not sTarget then return true end
+        if target.type ~= sTarget.type then return true end
+        if target.value ~= sTarget.value then return true end
         
-        if table.getn(target.healers) ~= table.getn(sTarget.healers) then 
-            return true 
-        end
+        if table.getn(target.healers) ~= table.getn(sTarget.healers) then return true end
         
         for j, healer in ipairs(target.healers) do
             if healer ~= sTarget.healers[j] then return true end
@@ -1243,19 +1245,18 @@ local function CreateOptionsFrame()
     chanEdit:SetHeight(20)
     chanEdit:SetPoint("LEFT", sec2, "RIGHT", 8, 0)
     chanEdit:SetAutoFocus(false)
-    chanEdit:SetMaxLetters(3)
+    chanEdit:SetMaxLetters(32)
     chanEdit:SetNumeric(false)
     chanEdit:SetText(tostring(HealAssignDB.options.chatChannel or ""))
     chanEdit:SetScript("OnEnterPressed", function()
-    this:ClearFocus()
-    local val = this:GetText()
-    if val and val ~= "" then HealAssignDB.options.chatChannel = val end
-end)
-chanEdit:SetScript("OnEditFocusLost", function()
-    local val = this:GetText()
-    if val and val ~= "" then HealAssignDB.options.chatChannel = val end
-end)
-
+        this:ClearFocus()
+        local val = this:GetText()
+        if val and val ~= "" then HealAssignDB.options.chatChannel = val end
+    end)
+    chanEdit:SetScript("OnEditFocusLost", function()
+        local val = this:GetText()
+        if val and val ~= "" then HealAssignDB.options.chatChannel = val end
+    end)
 
     local chanNote = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     chanNote:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -205)
@@ -1390,80 +1391,6 @@ end
 -------------------------------------------------------------------------------
 local incomingChunks = {}
 
--------------------------------------------------------------------------------
--- EDITOR LOCK SYSTEM
--- Only one raid leader/officer may have the main frame open at a time.
--- Protocol (addon messages):
---   "LOCK;name"    -- "name" has taken the editor lock (broadcast on open)
---   "UNLOCK;name"  -- "name" released the lock (broadcast on close)
---   "LOCKQUERY"    -- someone is asking who holds the lock
---   "LOCKACK;name" -- reply: "name" currently holds the lock
--------------------------------------------------------------------------------
-local editorLockHolder = nil   -- name of player who currently holds the lock (nil = free)
-
--- Returns true only if the local player is Raid Leader or Raid Assistant.
--- No raid = no rights. Party leader alone is not sufficient.
-function HasEditorRights()
-    local numRaid = GetNumRaidMembers()
-    if not numRaid or numRaid == 0 then
-        return false  -- must be in a raid
-    end
-    local myName = UnitName("player")
-    for i = 1, numRaid do
-        local name, rank = GetRaidRosterInfo(i)
-        -- rank: 0 = member, 1 = assistant, 2 = leader
-        if name == myName and rank >= 1 then
-            return true
-        end
-    end
-    return false
-end
-
--- Send a lock message to the group
-function SendLockMessage(msgType, playerName)
-    local numRaid = GetNumRaidMembers()
-    local channel
-    if numRaid and numRaid > 0 then
-        channel = "RAID"
-    elseif GetNumPartyMembers() and GetNumPartyMembers() > 0 then
-        channel = "PARTY"
-    else
-        return  -- solo, no need to broadcast
-    end
-    local payload = playerName and (msgType..";"..playerName) or msgType
-    SendAddonMessage(COMM_PREFIX, payload, channel)
-end
-
--- Try to acquire the editor lock. Returns true on success, false if blocked.
-function AcquireEditorLock()
-    local myName = UnitName("player")
-    if not HasEditorRights() then
-        local numRaid = GetNumRaidMembers()
-        if not numRaid or numRaid == 0 then
-            DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r You must be in a raid to edit assignments.")
-        else
-            DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Only Raid Leader or Assistant can edit assignments.")
-        end
-        return false
-    end
-    if editorLockHolder and editorLockHolder ~= myName then
-        DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Editor is currently open by |cffffd700"..editorLockHolder.."|r.")
-        return false
-    end
-    editorLockHolder = myName
-    SendLockMessage("LOCK", myName)
-    return true
-end
-
--- Release the editor lock (call on close)
-function ReleaseEditorLock()
-    local myName = UnitName("player")
-    if editorLockHolder == myName then
-        editorLockHolder = nil
-        SendLockMessage("UNLOCK", myName)
-    end
-end
-
 function HealAssign_SyncTemplate()
     local tmpl = GetActiveTemplate()
     if not tmpl then
@@ -1515,47 +1442,6 @@ end
 local function HandleAddonMessage(prefix, msg, channel, sender)
     if prefix ~= COMM_PREFIX then return end
     if sender == UnitName("player") then return end
-
-    -- Handle editor lock protocol messages first
-    -- Note: string.match does not exist in Lua 5.0 (WoW 1.12), use string.find instead
-    local _, _, lockName = string.find(msg, "^LOCK;(.+)$")
-    if lockName then
-        editorLockHolder = lockName
-        -- If we have the main frame open and someone else grabbed the lock, force-close it
-        if mainFrame and mainFrame:IsShown() and lockName ~= UnitName("player") then
-            mainFrame:Hide()
-            CloseDropdown()
-            DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Editor taken by |cffffd700"..lockName.."|r. Your window was closed.")
-        end
-        return
-    end
-
-    local _, _, unlockName = string.find(msg, "^UNLOCK;(.+)$")
-    if unlockName then
-        if editorLockHolder == unlockName then
-            editorLockHolder = nil
-            -- Only notify players who actually have rights to open the editor
-            if HasEditorRights() then
-                DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r |cffffd700"..unlockName.."|r closed the editor. You may now open it.")
-            end
-        end
-        return
-    end
-
-    if msg == "LOCKQUERY" then
-        -- Someone is asking who holds the lock; if we hold it, reply
-        local myName = UnitName("player")
-        if editorLockHolder == myName then
-            SendLockMessage("LOCKACK", myName)
-        end
-        return
-    end
-
-    local _, _, ackName = string.find(msg, "^LOCKACK;(.+)$")
-    if ackName then
-        editorLockHolder = ackName
-        return
-    end
 
     -- Parse S;index;total;data format
     local _, _, cIdx, tChunks, d = string.find(msg, "^S;(%d+);(%d+);(.+)$")
@@ -1737,13 +1623,9 @@ SlashCmdList["HEALASSIGN"] = function(msg)
         -- Toggle main frame
         if mainFrame then
             if mainFrame:IsShown() then
-                ReleaseEditorLock()
                 mainFrame:Hide()
                 CloseDropdown()
             else
-                if not AcquireEditorLock() then return end
-                -- Query in case another client holds a stale lock we don't know about yet
-                SendLockMessage("LOCKQUERY", nil)
                 mainFrame:Show()
                 if currentTemplate then
                     mainFrame.nameEdit:SetText(currentTemplate.name)
@@ -1751,8 +1633,6 @@ SlashCmdList["HEALASSIGN"] = function(msg)
                 end
             end
         else
-            if not AcquireEditorLock() then return end
-            SendLockMessage("LOCKQUERY", nil)
             CreateMainFrame()
             if currentTemplate then
                 mainFrame.nameEdit:SetText(currentTemplate.name)
@@ -1761,4 +1641,3 @@ SlashCmdList["HEALASSIGN"] = function(msg)
         end
     end
 end
-
