@@ -76,7 +76,7 @@ local function InitDB()
             tankClasses = {
                 ["WARRIOR"] = true,
                 ["DRUID"]   = true,
-                ["PALADIN"] = true,
+                ["SHAMAN"] = true,
             },
             customTargets = {},
             chatChannel = 1,
@@ -1758,3 +1758,4 @@ SlashCmdList["HEALASSIGN"] = function(msg)
         end
     end
 end
+
