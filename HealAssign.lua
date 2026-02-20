@@ -832,7 +832,13 @@ local function CreateMainFrame()
     local closeBtn = CreateFrame("Button", nil, f, "UIPanelCloseButton")
     closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -4, -4)
     closeBtn:SetScript("OnClick", function()
+        ReleaseEditorLock()
         f:Hide()
+        CloseDropdown()
+    end)
+    -- Also release lock if frame is hidden by any other means
+    f:SetScript("OnHide", function()
+        ReleaseEditorLock()
         CloseDropdown()
     end)
 
@@ -1383,6 +1389,80 @@ end
 -------------------------------------------------------------------------------
 local incomingChunks = {}
 
+-------------------------------------------------------------------------------
+-- EDITOR LOCK SYSTEM
+-- Only one raid leader/officer may have the main frame open at a time.
+-- Protocol (addon messages):
+--   "LOCK;name"    -- "name" has taken the editor lock (broadcast on open)
+--   "UNLOCK;name"  -- "name" released the lock (broadcast on close)
+--   "LOCKQUERY"    -- someone is asking who holds the lock
+--   "LOCKACK;name" -- reply: "name" currently holds the lock
+-------------------------------------------------------------------------------
+local editorLockHolder = nil   -- name of player who currently holds the lock (nil = free)
+
+-- Returns true only if the local player is Raid Leader or Raid Assistant.
+-- No raid = no rights. Party leader alone is not sufficient.
+function HasEditorRights()
+    local numRaid = GetNumRaidMembers()
+    if not numRaid or numRaid == 0 then
+        return false  -- must be in a raid
+    end
+    local myName = UnitName("player")
+    for i = 1, numRaid do
+        local name, rank = GetRaidRosterInfo(i)
+        -- rank: 0 = member, 1 = assistant, 2 = leader
+        if name == myName and rank >= 1 then
+            return true
+        end
+    end
+    return false
+end
+
+-- Send a lock message to the group
+function SendLockMessage(msgType, playerName)
+    local numRaid = GetNumRaidMembers()
+    local channel
+    if numRaid and numRaid > 0 then
+        channel = "RAID"
+    elseif GetNumPartyMembers() and GetNumPartyMembers() > 0 then
+        channel = "PARTY"
+    else
+        return  -- solo, no need to broadcast
+    end
+    local payload = playerName and (msgType..";"..playerName) or msgType
+    SendAddonMessage(COMM_PREFIX, payload, channel)
+end
+
+-- Try to acquire the editor lock. Returns true on success, false if blocked.
+function AcquireEditorLock()
+    local myName = UnitName("player")
+    if not HasEditorRights() then
+        local numRaid = GetNumRaidMembers()
+        if not numRaid or numRaid == 0 then
+            DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r You must be in a raid to edit assignments.")
+        else
+            DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Only Raid Leader or Assistant can edit assignments.")
+        end
+        return false
+    end
+    if editorLockHolder and editorLockHolder ~= myName then
+        DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Editor is currently open by |cffffd700"..editorLockHolder.."|r.")
+        return false
+    end
+    editorLockHolder = myName
+    SendLockMessage("LOCK", myName)
+    return true
+end
+
+-- Release the editor lock (call on close)
+function ReleaseEditorLock()
+    local myName = UnitName("player")
+    if editorLockHolder == myName then
+        editorLockHolder = nil
+        SendLockMessage("UNLOCK", myName)
+    end
+end
+
 function HealAssign_SyncTemplate()
     local tmpl = GetActiveTemplate()
     if not tmpl then
@@ -1434,6 +1514,47 @@ end
 local function HandleAddonMessage(prefix, msg, channel, sender)
     if prefix ~= COMM_PREFIX then return end
     if sender == UnitName("player") then return end
+
+    -- Handle editor lock protocol messages first
+    -- Note: string.match does not exist in Lua 5.0 (WoW 1.12), use string.find instead
+    local _, _, lockName = string.find(msg, "^LOCK;(.+)$")
+    if lockName then
+        editorLockHolder = lockName
+        -- If we have the main frame open and someone else grabbed the lock, force-close it
+        if mainFrame and mainFrame:IsShown() and lockName ~= UnitName("player") then
+            mainFrame:Hide()
+            CloseDropdown()
+            DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Editor taken by |cffffd700"..lockName.."|r. Your window was closed.")
+        end
+        return
+    end
+
+    local _, _, unlockName = string.find(msg, "^UNLOCK;(.+)$")
+    if unlockName then
+        if editorLockHolder == unlockName then
+            editorLockHolder = nil
+            -- Only notify players who actually have rights to open the editor
+            if HasEditorRights() then
+                DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r |cffffd700"..unlockName.."|r closed the editor. You may now open it.")
+            end
+        end
+        return
+    end
+
+    if msg == "LOCKQUERY" then
+        -- Someone is asking who holds the lock; if we hold it, reply
+        local myName = UnitName("player")
+        if editorLockHolder == myName then
+            SendLockMessage("LOCKACK", myName)
+        end
+        return
+    end
+
+    local _, _, ackName = string.find(msg, "^LOCKACK;(.+)$")
+    if ackName then
+        editorLockHolder = ackName
+        return
+    end
 
     -- Parse S;index;total;data format
     local _, _, cIdx, tChunks, d = string.find(msg, "^S;(%d+);(%d+);(.+)$")
@@ -1613,9 +1734,13 @@ SlashCmdList["HEALASSIGN"] = function(msg)
         -- Toggle main frame
         if mainFrame then
             if mainFrame:IsShown() then
+                ReleaseEditorLock()
                 mainFrame:Hide()
                 CloseDropdown()
             else
+                if not AcquireEditorLock() then return end
+                -- Query in case another client holds a stale lock we don't know about yet
+                SendLockMessage("LOCKQUERY", nil)
                 mainFrame:Show()
                 if currentTemplate then
                     mainFrame.nameEdit:SetText(currentTemplate.name)
@@ -1623,6 +1748,8 @@ SlashCmdList["HEALASSIGN"] = function(msg)
                 end
             end
         else
+            if not AcquireEditorLock() then return end
+            SendLockMessage("LOCKQUERY", nil)
             CreateMainFrame()
             if currentTemplate then
                 mainFrame.nameEdit:SetText(currentTemplate.name)
