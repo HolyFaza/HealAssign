@@ -1,32 +1,62 @@
-# HealAssign
+# HealAssign v2.0.0
 
-A raid healing assignment addon for **World of Warcraft 1.12.1** (Vanilla).
+A healer assignment addon for **World of Warcraft 1.12.1 (Vanilla / Turtle WoW)**.
 
-Raid leaders and assistants create healer assignment templates — defining which healers cover which tanks or groups — then sync them to the entire raid with a single command. Every healer with the addon installed instantly sees their personal assignment in a small, movable frame.
+Designed for raid leaders and healers to manage and display healing assignments in real time — with death alerts, unattended target tracking, and a viewer mode for tanks and officers.
 
 ---
 
 ## Features
 
-- Assign healers to tanks, raid groups, or custom targets
-- Save and load multiple named templates
-- One-click raid sync via addon messaging
-- Personal assignment frame for each healer
-- Editor lock system — only one person can edit at a time
-- Role-gated access — Raid Leader and Assistants only
-- Death notifications for tanks and healers in a configured chat channel
-- Class-colored player names throughout the UI
+### Assignment Management (Raid Leader)
+- Create, save, load, and delete named **templates**
+- Assign healers to **tanks** (by name), **groups** (1–8), or **custom targets**
+- **Reset** clears all assignments while keeping the template
+- **Sync** broadcasts the current template to all raid members with the addon
+
+### Raid Roster
+- Tag players with:
+  - **T** — Tank (appears in the Tank dropdown when assigning)
+  - **H** — Healer (appears as a healer column in the main grid)
+  - **V** — Viewer (receives assignments read-only, e.g. tanks, officers)
+- T and H are mutually exclusive; V can be combined with either
+- **Reset Tags** clears all tags for the current template
+
+### Healer Assignment Window
+- Each healer tagged **H** sees their own compact assignment window
+- Targets colored by type: Tank = class color, Group = blue, Custom = purple
+- Hidden outside raid by default (toggle in Options)
+- When another healer dies: their **unattended targets** appear in your window under the dead healer's name (in their class color), until they are resurrected
+
+### Death Alerts
+- When a healer dies, all players tagged **H** or **V** receive:
+  - A large **on-screen alert** (DBM-style) with the healer's name — fades after 7 seconds
+  - An **audio alert**
+  - **Unattended targets** appear in their assignment window
+- Targets clear automatically when the healer is resurrected
+- Ghost state does not count as resurrection — targets stay until the healer is actually alive
+
+### Viewer Mode (V tag)
+- Inverted read-only window: **Target → Healers**
+- Dead healers shown in **red**
+- Receives death alerts and audio notification
+
+### Options
+- Font size for the assignment window (8–24)
+- Window opacity
+- Show assignment window outside raid
+- Custom assignment targets (e.g. "Main Tank", "OT", "Skull")
 
 ---
 
 ## Installation
 
-1. Download or clone this repository
-2. Copy the `HealAssign` folder into your addons directory:
-```
-World of Warcraft/Interface/AddOns/HealAssign/
-```
-3. Restart the game client or type `/console reloadui`
+1. Place the `HealAssign` folder in:
+   ```
+   World of Warcraft/Interface/AddOns/HealAssign/
+   ```
+2. The folder must contain `HealAssign.lua` and `HealAssign.toc`
+3. Enable the addon in the AddOns menu on the character select screen
 
 ---
 
@@ -34,114 +64,41 @@ World of Warcraft/Interface/AddOns/HealAssign/
 
 | Command | Description |
 |---|---|
-| `/ha` or `/healassign` | Toggle the main editor window |
-| `/ha sync` | Sync the active template to all raid members |
-| `/ha assign` | Toggle your personal assignments frame |
-| `/ha options` | Open the options panel |
-| `/ha help` | Print all commands to chat |
+| `/ha` | Open the main window |
+| `/ha sync` | Broadcast current template to raid |
+| `/ha options` | Open options |
+| `/ha assign` | Toggle the assignment window |
 
 ---
 
-## Access & Permissions
+## Quick Start
 
-Only **Raid Leaders and Assistants** can open the editor and make changes. Regular raid members receive assignments via sync but cannot edit them.
-
-The editor can only be open by **one player at a time**. If another assistant already has it open, you will see their name in chat. When they close it, all eligible players are notified that the editor is free.
-
----
-
-## Usage
-
-### Typical workflow
-
-1. Open the editor: `/ha`
-2. Enter a template name in the **Template:** field (e.g. `MC_farm`)
-3. Click **Add Tank** → select tanks from the raid roster
-4. For each tank, click **Add Healer** → assign healers from the dropdown
-5. Click **Save**
-6. Type `/ha sync` — all raid members receive the assignments
-7. Close the window — the editor lock is released
+1. Enter raid → open **Raid Roster**
+2. Tag tanks **T**, healers **H**, viewers **V**
+3. Assign targets to each healer using **Tank / Group / Custom** buttons
+4. **Save** the template → **Sync** to broadcast to all
 
 ---
 
-### Template toolbar
+## Requirements
 
-| Button | Description |
-|---|---|
-| **New** | Clear the workspace and start a fresh template. If there are unsaved changes, a prompt will ask whether to save first. |
-| **Load** | Load a previously saved template from a dropdown list. |
-| **Save** | Save the current template under the name in the **Template:** field. A name is required. |
-| **Reset** | Clear all assignments while keeping the template name. |
-| **Del** | Permanently delete the current template after confirmation. |
-
-> **Note on New:** If you click **New** with unsaved changes, a dialog appears. Clicking **Save** in that dialog saves the template and clears the workspace. If the name field is empty, saving will be blocked with a warning — enter a name first.
+- WoW 1.12.1 or Turtle WoW
+- All healers and viewers need the addon installed to receive synced assignments and alerts
 
 ---
 
-### Adding targets
+## Changelog
 
-| Button | Description |
-|---|---|
-| **Add Tank** | Add a tank from the raid. Shows Warriors, Druids, and Paladins by default (configurable in Options). Falls back to the full roster if none are found. |
-| **Add Group** | Add a raid group (Group 1–8) as an assignment target. |
-| **Add Custom** | Add a custom target defined in Options (e.g. "Offtank", "Melee"). |
+### v2.0.0
+- Full rewrite: healer-centric layout (one column per healer)
+- Roster tag system: T / H / V with mutual exclusion rules
+- DBM-style death alerts with sound and fade animation
+- Unattended target tracking with resurrection detection
+- Viewer mode (target → healers, inverted display)
+- Dynamic grid: 2 / 3 / 4 columns based on healer count
+- Template system with save / load / delete and confirmation dialogs
+- Tooltips on all buttons
+- Custom targets support
 
----
-
-### Managing assignments
-
-Once a target is added, it appears in the assignment list:
-
-- **Add Healer** — opens a dropdown of raid members; select a healer to assign. A healer cannot be assigned to the same target twice.
-- **X** next to a target — removes the target and all its assigned healers.
-- **X** next to a healer — removes only that healer from the target.
-
-Tank and healer names are displayed in **class colors** when the player is present in the raid.
-
----
-
-## Personal Assignments Frame
-
-A small, draggable frame visible to every player with the addon. It displays:
-
-- The name of the active template
-- The specific target this player is assigned to heal
-
-If the player has no assignments in the current template, it shows `No assignments for you`.
-
-Toggle visibility with `/ha assign` or via the **Show My Assignments Frame** checkbox in Options.
-
----
-
-## Options (`/ha options`)
-
-| Setting | Description |
-|---|---|
-| **Tank Classes** | Which classes appear in the Add Tank dropdown (default: Warrior, Druid, Paladin) |
-| **Custom Targets** | Define your own assignment targets for the Add Custom button |
-| **Chat Channel** | Channel number for death notifications (0 = disabled) |
-| **Font Size** | Text size in the personal assignments frame |
-| **Show My Assignments Frame** | Show or hide the personal assignments frame |
-
----
-
-## Death Notifications
-
-When a **Chat Channel** number is configured in Options, the addon automatically announces in that channel when:
-
-- A **tank** from the active template dies — lists their assigned healers
-- A **healer** from the active template dies — states who they were covering
-
----
-
-## Compatibility
-
-- World of Warcraft **1.12.1** (Vanilla / Classic Era private servers)
-- Written in **Lua 5.0** — no Lua 5.1+ functions used (`string.find` instead of `string.match`, etc.)
-- Uses `SendAddonMessage` for raid communication — recipients must have the addon installed to receive syncs
-
----
-
-## License
-
-This project is released under the [MIT License](LICENSE).
+### v1.x
+- Target-centric layout, basic assignment and sync
