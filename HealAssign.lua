@@ -1,892 +1,83 @@
--- HealAssign.lua
--- WoW 1.12.1 Addon for raid heal assignments
--- Assign healers to tanks and groups, sync with raid members
+-- HealAssign.lua v2.0
+-- WoW 1.12.1 Heal Assignment Addon
+-- Healer-centric assignment system
 
 -------------------------------------------------------------------------------
--- CONSTANTS & CLASS COLORS
+-- CONSTANTS
 -------------------------------------------------------------------------------
-local ADDON_NAME = "HealAssign"
-local ADDON_VERSION = "1.0.4"
-local COMM_PREFIX = "HealAssign"
+local ADDON_NAME    = "HealAssign"
+local ADDON_VERSION = "2.0.0"
+local COMM_PREFIX   = "HealAssign"
 
 local CLASS_COLORS = {
-    ["WARRIOR"]     = {r=0.78, g=0.61, b=0.43},
-    ["PALADIN"]     = {r=0.96, g=0.55, b=0.73},
-    ["HUNTER"]      = {r=0.67, g=0.83, b=0.45},
-    ["ROGUE"]       = {r=1.00, g=0.96, b=0.41},
-    ["PRIEST"]      = {r=1.00, g=1.00, b=1.00},
-    ["SHAMAN"]      = {r=0.00, g=0.44, b=0.87},
-    ["MAGE"]        = {r=0.41, g=0.80, b=0.94},
-    ["WARLOCK"]     = {r=0.58, g=0.51, b=0.79},
-    ["DRUID"]       = {r=1.00, g=0.49, b=0.04},
+    ["WARRIOR"] = {r=0.78,g=0.61,b=0.43},
+    ["PALADIN"] = {r=0.96,g=0.55,b=0.73},
+    ["HUNTER"]  = {r=0.67,g=0.83,b=0.45},
+    ["ROGUE"]   = {r=1.00,g=0.96,b=0.41},
+    ["PRIEST"]  = {r=1.00,g=1.00,b=1.00},
+    ["SHAMAN"]  = {r=0.00,g=0.44,b=0.87},
+    ["MAGE"]    = {r=0.41,g=0.80,b=0.94},
+    ["WARLOCK"] = {r=0.58,g=0.51,b=0.79},
+    ["DRUID"]   = {r=1.00,g=0.49,b=0.04},
 }
 
 local CLASS_NAMES = {
-    "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST",
-    "SHAMAN", "MAGE", "WARLOCK", "DRUID"
+    "WARRIOR","PALADIN","HUNTER","ROGUE","PRIEST",
+    "SHAMAN","MAGE","WARLOCK","DRUID"
 }
 
 local CLASS_DISPLAY = {
-    ["WARRIOR"]  = "Warrior",
-    ["PALADIN"]  = "Paladin",
-    ["HUNTER"]   = "Hunter",
-    ["ROGUE"]    = "Rogue",
-    ["PRIEST"]   = "Priest",
-    ["SHAMAN"]   = "Shaman",
-    ["MAGE"]     = "Mage",
-    ["WARLOCK"]  = "Warlock",
-    ["DRUID"]    = "Druid",
+    ["WARRIOR"]="Warrior",["PALADIN"]="Paladin",["HUNTER"]="Hunter",
+    ["ROGUE"]="Rogue",["PRIEST"]="Priest",["SHAMAN"]="Shaman",
+    ["MAGE"]="Mage",["WARLOCK"]="Warlock",["DRUID"]="Druid",
 }
 
--------------------------------------------------------------------------------
--- SAVED VARIABLES DEFAULT
--------------------------------------------------------------------------------
--------------------------------------------------------------------------------
--- SAVED VARIABLES DEFAULT
--- NOTE: Do NOT pre-initialize HealAssignDB here.
--- In WoW 1.12, SavedVariables are nil until VARIABLES_LOADED fires.
--- InitDB() is called from the VARIABLES_LOADED event handler.
--------------------------------------------------------------------------------
-local function InitDB()
-    -- Ensure the global exists
-    if not HealAssignDB then HealAssignDB = {} end
-    if not HealAssignDB.templates then HealAssignDB.templates = {} end
-    if not HealAssignDB.activeTemplate then HealAssignDB.activeTemplate = nil end
-    
-    -- Default Options
-    if not HealAssignDB.options then
-        HealAssignDB.options = {
-            tankClasses = {
-                ["WARRIOR"] = true,
-                ["DRUID"]   = true,
-                ["PALADIN"] = true,
-            },
-            customTargets = {},
-            chatChannel = "",
-            showAssignFrame = true,
-            fontSize = 12,
-        }
-    end
+local TYPE_TANK   = "tank"
 
-    -- Safety checks
-    if not HealAssignDB.options.customTargets then HealAssignDB.options.customTargets = {} end
-    if not HealAssignDB.options.chatChannel then HealAssignDB.options.chatChannel = "" end
-    if HealAssignDB.options.showAssignFrame == nil then HealAssignDB.options.showAssignFrame = true end
-    if not HealAssignDB.options.fontSize then HealAssignDB.options.fontSize = 12 end
-    if not HealAssignDB.options.tankClasses then
-        HealAssignDB.options.tankClasses = {
-            ["WARRIOR"] = true,
-            ["DRUID"]   = true,
-            ["SHAMAN"] = true,
-        }
-    end
-
-    -- Dialog 1: Confirm Delete
-    StaticPopupDialogs["HEALASSIGN_CONFIRM_DELETE"] = {
-        text = "Are you sure you want to delete template '%s'?",
-        button1 = "Yes",
-        button2 = "No",
-        OnAccept = function()
-            local name = HealAssignNameEdit:GetText()
-            if name and HealAssignDB.templates[name] then
-                HealAssignDB.templates[name] = nil
-                
-                if HealAssignDB.activeTemplate == name or (currentTemplate and currentTemplate.name == name) then
-                    HealAssignDB.activeTemplate = nil
-                    currentTemplate = { name = "", targets = {} }
-                    HealAssignNameEdit:SetText("")
-                end
-                
-                -- Check for function existence before calling to avoid nil errors
-                if type(RebuildMainRows) == "function" then RebuildMainRows() end
-                if type(UpdateAssignFrame) == "function" then UpdateAssignFrame() end
-                DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Template '"..name.."' deleted.")
-            end
-        end,
-        timeout = 0,
-        whileDead = true,
-        hideOnEscape = true,
-    }
-
-    -- Dialog 2: Save before New
-    StaticPopupDialogs["HEALASSIGN_SAVE_BEFORE_NEW"] = {
-        text = "Current template has unsaved changes. Save before creating a new one?",
-        button1 = "Save",
-        button2 = "Discard",
-        OnAccept = function()
-            local name = HealAssignNameEdit:GetText()
-            if name and name ~= "" then
-                -- Note: DeepCopy must be global or defined before InitDB to work here
-                if type(DeepCopy) == "function" then
-                    HealAssignDB.templates[name] = DeepCopy(currentTemplate)
-                    HealAssignDB.activeTemplate = name
-                    DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Template '"..name.."' saved.")
-                end
-            end
-            currentTemplate = { name = "", targets = {} }
-            HealAssignDB.activeTemplate = nil
-            HealAssignNameEdit:SetText("")
-            if type(RebuildMainRows) == "function" then RebuildMainRows() end
-            if type(UpdateAssignFrame) == "function" then UpdateAssignFrame() end
-        end,
-        OnCancel = function()
-            currentTemplate = { name = "", targets = {} }
-            HealAssignDB.activeTemplate = nil
-            HealAssignNameEdit:SetText("")
-            if type(RebuildMainRows) == "function" then RebuildMainRows() end
-            if type(UpdateAssignFrame) == "function" then UpdateAssignFrame() end
-        end,
-        timeout = 0,
-        whileDead = true,
-        hideOnEscape = true,
-    }
-end
-
+-- Stack for tracking open windows (ESC closes in reverse order)
+local openStack = {}
+local TYPE_GROUP  = "group"
+local TYPE_CUSTOM = "custom"
 
 -------------------------------------------------------------------------------
--- UTILITY FUNCTIONS
+-- DEEP COPY
 -------------------------------------------------------------------------------
-local function GetClassColor(class)
-    local c = CLASS_COLORS[class]
-    if c then
-        return c.r, c.g, c.b
-    end
-    return 1, 1, 1
-end
-
--- Get all raid/party members with their class
-local function GetRaidMembers()
-    local members = {}
-    local numRaid = GetNumRaidMembers()
-    if numRaid and numRaid > 0 then
-        for i = 1, numRaid do
-            local name, rank, subgroup, level, class, fileName, zone, online, isDead = GetRaidRosterInfo(i)
-            if name then
-                -- fileName is the uppercase class name in 1.12
-                table.insert(members, {name=name, class=fileName or class, subgroup=subgroup, online=online})
-            end
-        end
-    else
-        local pname = UnitName("player")
-        local _, pclass = UnitClass("player")
-        if pname then
-            table.insert(members, {name=pname, class=pclass, subgroup=1, online=true})
-        end
-        local numParty = GetNumPartyMembers()
-        if numParty and numParty > 0 then
-            for i = 1, numParty do
-                local mname = UnitName("party"..i)
-                local _, mclass = UnitClass("party"..i)
-                if mname then
-                    table.insert(members, {name=mname, class=mclass, subgroup=1, online=true})
-                end
-            end
-        end
-    end
-    table.sort(members, function(a,b) return a.name < b.name end)
-    return members
-end
-
--- Get player class by name from raid/party
-local function GetPlayerClass(playerName)
-    if not playerName then return nil end
-    local numRaid = GetNumRaidMembers()
-    if numRaid and numRaid > 0 then
-        for i = 1, numRaid do
-            local name, rank, subgroup, level, class, fileName = GetRaidRosterInfo(i)
-            if name == playerName then
-                return fileName or class
-            end
-        end
-    end
-    if UnitName("player") == playerName then
-        local _, pclass = UnitClass("player")
-        return pclass
-    end
-    local numParty = GetNumPartyMembers()
-    if numParty and numParty > 0 then
-        for i = 1, numParty do
-            if UnitName("party"..i) == playerName then
-                local _, c = UnitClass("party"..i)
-                return c
-            end
-        end
-    end
-    return nil
-end
-
--- Serialize template to string for addon comm
--- Format: v1~name~type:value,type:value,...~idx:h1;h2|idx:h1;h2
-local function Serialize(t)
-    local parts = {}
-    table.insert(parts, "v1")
-    table.insert(parts, t.name or "")
-
-    local targetParts = {}
-    for i, target in ipairs(t.targets or {}) do
-        -- Escape colons/commas in values
-        local safeVal = string.gsub(target.value or "", "[,~|;:]", "_")
-        table.insert(targetParts, target.type..":"..safeVal)
-    end
-    table.insert(parts, table.concat(targetParts, ","))
-
-    local healerParts = {}
-    for i, target in ipairs(t.targets or {}) do
-        local hlist = {}
-        for _, h in ipairs(target.healers or {}) do
-            table.insert(hlist, h)
-        end
-        table.insert(healerParts, i..":"..table.concat(hlist, ";"))
-    end
-    table.insert(parts, table.concat(healerParts, "|"))
-
-    return table.concat(parts, "~")
-end
-
-local function Deserialize(str)
-    if not str then return nil end
-    local parts = {}
-    -- Split by ~
-    local i = 1
-    local last = 1
-    while i <= string.len(str) do
-        if string.sub(str, i, i) == "~" then
-            table.insert(parts, string.sub(str, last, i-1))
-            last = i + 1
-        end
-        i = i + 1
-    end
-    table.insert(parts, string.sub(str, last))
-
-    if parts[1] ~= "v1" then return nil end
-    local t = {}
-    t.name = parts[2] or ""
-    t.targets = {}
-
-    if parts[3] and parts[3] ~= "" then
-        -- Split by comma
-        local tstr = parts[3]
-        local ti = 1
-        local tlast = 1
-        while ti <= string.len(tstr) do
-            if string.sub(tstr, ti, ti) == "," then
-                local entry = string.sub(tstr, tlast, ti-1)
-                local colon = string.find(entry, ":")
-                if colon then
-                    local ttype = string.sub(entry, 1, colon-1)
-                    local tval = string.sub(entry, colon+1)
-                    table.insert(t.targets, {type=ttype, value=tval, healers={}})
-                end
-                tlast = ti + 1
-            end
-            ti = ti + 1
-        end
-        -- Last entry
-        local entry = string.sub(tstr, tlast)
-        if entry ~= "" then
-            local colon = string.find(entry, ":")
-            if colon then
-                local ttype = string.sub(entry, 1, colon-1)
-                local tval = string.sub(entry, colon+1)
-                table.insert(t.targets, {type=ttype, value=tval, healers={}})
-            end
-        end
-    end
-
-    if parts[4] and parts[4] ~= "" then
-        -- Split by |
-        local hstr = parts[4]
-        local hi = 1
-        local hlast = 1
-        while hi <= string.len(hstr) do
-            if string.sub(hstr, hi, hi) == "|" then
-                local entry = string.sub(hstr, hlast, hi-1)
-                local colon = string.find(entry, ":")
-                if colon then
-                    local idx = tonumber(string.sub(entry, 1, colon-1))
-                    local healers_str = string.sub(entry, colon+1)
-                    if idx and t.targets[idx] then
-                        t.targets[idx].healers = {}
-                        if healers_str ~= "" then
-                            -- Split by ;
-                            local si = 1
-                            local slast = 1
-                            while si <= string.len(healers_str) do
-                                if string.sub(healers_str, si, si) == ";" then
-                                    local h = string.sub(healers_str, slast, si-1)
-                                    if h ~= "" then table.insert(t.targets[idx].healers, h) end
-                                    slast = si + 1
-                                end
-                                si = si + 1
-                            end
-                            local h = string.sub(healers_str, slast)
-                            if h ~= "" then table.insert(t.targets[idx].healers, h) end
-                        end
-                    end
-                end
-                hlast = hi + 1
-            end
-            hi = hi + 1
-        end
-        -- Last entry
-        local entry = string.sub(hstr, hlast)
-        if entry ~= "" then
-            local colon = string.find(entry, ":")
-            if colon then
-                local idx = tonumber(string.sub(entry, 1, colon-1))
-                local healers_str = string.sub(entry, colon+1)
-                if idx and t.targets[idx] then
-                    t.targets[idx].healers = {}
-                    if healers_str ~= "" then
-                        local si = 1
-                        local slast = 1
-                        while si <= string.len(healers_str) do
-                            if string.sub(healers_str, si, si) == ";" then
-                                local h = string.sub(healers_str, slast, si-1)
-                                if h ~= "" then table.insert(t.targets[idx].healers, h) end
-                                slast = si + 1
-                            end
-                            si = si + 1
-                        end
-                        local h = string.sub(healers_str, slast)
-                        if h ~= "" then table.insert(t.targets[idx].healers, h) end
-                    end
-                end
-            end
-        end
-    end
-
-    return t
-end
-
--------------------------------------------------------------------------------
--- MAIN FRAME VARIABLES
--------------------------------------------------------------------------------
-local mainFrame = nil
-local optionsFrame = nil
-local assignFrame = nil
-local dropdownFrame = nil
-local activeDropdown = nil
-
-local currentTemplate = nil
-local templateRows = {}
-
--------------------------------------------------------------------------------
--- DROPDOWN MENU
--------------------------------------------------------------------------------
-local function CloseDropdown()
-    if dropdownFrame then
-        dropdownFrame:Hide()
-    end
-    activeDropdown = nil
-end
-
--- Global variables for dropdown control
-local lastDropdownCloseTime = 0
-local activeDropdownAnchor = nil
-
-local function CloseDropdown()
-    if dropdownFrame and dropdownFrame:IsShown() then
-        dropdownFrame:Hide()
-        if dropdownLocker then dropdownLocker:Hide() end
-        lastDropdownCloseTime = GetTime()
-        activeDropdownAnchor = nil
-    end
-end
-
-local function ShowDropdown(anchorFrame, items, onSelect, width)
-    -- Toggle logic: if clicking the same button that opened it, just close and exit
-    if dropdownFrame and dropdownFrame:IsShown() and activeDropdownAnchor == anchorFrame then
-        CloseDropdown()
-        return
-    end
-
-    -- If another dropdown is open, close it first
-    CloseDropdown()
-
-    -- Create locker to detect clicks outside
-    if not dropdownLocker then
-        dropdownLocker = CreateFrame("Button", "HealAssignDropdownLocker", UIParent)
-        dropdownLocker:SetAllPoints(UIParent)
-        dropdownLocker:SetFrameStrata("BACKGROUND")
-        dropdownLocker:SetScript("OnClick", function()
-            CloseDropdown()
-        end)
-    end
-
-    if not dropdownFrame then
-        dropdownFrame = CreateFrame("Frame", "HealAssignDropdownFrame", UIParent)
-        dropdownFrame:SetFrameStrata("TOOLTIP")
-        dropdownFrame:SetBackdrop({
-            bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
-            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-            tile=true, tileSize=8, edgeSize=8,
-            insets={left=2,right=2,top=2,bottom=2}
-        })
-        dropdownFrame:SetBackdropColor(0.08, 0.08, 0.12, 0.97)
-        dropdownFrame.buttons = {}
-    end
-
-    local f = dropdownFrame
-    activeDropdownAnchor = anchorFrame
-    dropdownLocker:Show()
-
-    -- Hide all existing buttons
-    for _, b in ipairs(f.buttons) do
-        b:Hide()
-    end
-
-    local itemH = 18
-    local pad = 4
-    local w = width or 160
-    local h = table.getn(items) * itemH + pad * 2
-    if h < 20 then h = 20 end
-
-    f:SetWidth(w)
-    f:SetHeight(h)
-    f:ClearAllPoints()
-    f:SetPoint("TOPLEFT", anchorFrame, "BOTTOMLEFT", 0, -2)
-
-    for i, item in ipairs(items) do
-        local btn = f.buttons[i]
-        if not btn then
-            btn = CreateFrame("Button", nil, f)
-            btn:SetHeight(itemH)
-            btn:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight")
-            btn:GetHighlightTexture():SetAlpha(0.4)
-            local fs = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-            fs:SetPoint("LEFT", btn, "LEFT", 4, 0)
-            fs:SetPoint("RIGHT", btn, "RIGHT", -4, 0)
-            fs:SetJustifyH("LEFT")
-            btn.label = fs
-            f.buttons[i] = btn
-        end
-
-        btn:ClearAllPoints()
-        btn:SetPoint("TOPLEFT", f, "TOPLEFT", pad, -(pad + (i-1)*itemH))
-        btn:SetWidth(w - pad*2)
-        btn:Show()
-
-        if item.r then
-            btn.label:SetTextColor(item.r, item.g, item.b)
-        else
-            btn.label:SetTextColor(1, 1, 1)
-        end
-        btn.label:SetText(item.text or "")
-
-        local capturedItem = item
-        btn:SetScript("OnClick", function()
-            CloseDropdown()
-            onSelect(capturedItem)
-        end)
-    end
-
-    f:Show()
-    activeDropdown = f
-end
-
-
--------------------------------------------------------------------------------
--- TEMPLATE MANAGEMENT
--------------------------------------------------------------------------------
-local function NewTemplate(name)
-    return {
-        name = name or "New Template",
-        targets = {},
-    }
-end
-
-local function GetActiveTemplate()
-    if not HealAssignDB.activeTemplate then return nil end
-    return HealAssignDB.templates[HealAssignDB.activeTemplate]
-end
-
-local function SaveCurrentTemplate()
-    if not currentTemplate then return end
-    if not currentTemplate.name or currentTemplate.name == "" then
-        currentTemplate.name = "Template"
-    end
-    HealAssignDB.templates[currentTemplate.name] = currentTemplate
-    HealAssignDB.activeTemplate = currentTemplate.name
-end
-
--------------------------------------------------------------------------------
--- ASSIGNMENT DISPLAY FRAME (healer's personal view)
--------------------------------------------------------------------------------
-local function UpdateAssignFrame()
-    if not assignFrame then return end
-    if not assignFrame:IsShown() then return end
-
-    local myName = UnitName("player")
-    local content = assignFrame.content
-
-    -- Set the font size from options dynamically
-    local fontSize = (HealAssignDB.options and HealAssignDB.options.fontSize) or 12
-    content:SetFont("Fonts\\FRIZQT__.TTF", fontSize, "OUTLINE")
-
-    local tmpl = GetActiveTemplate()
-    if not tmpl then
-        content:SetText("|cff888888No active template.|r")
-        assignFrame:SetHeight(50)
-        return
-    end
-
-    local lines = {}
-    table.insert(lines, "|cff00ccff"..tmpl.name.."|r")
-
-    local found = false
-    for _, target in ipairs(tmpl.targets) do
-        for _, healer in ipairs(target.healers) do
-            if healer == myName then
-                found = true
-                local targetText = ""
-                if target.type == "tank" then
-                    local cls = GetPlayerClass(target.value)
-                    if cls then
-                        local r, g, b = GetClassColor(cls)
-                        targetText = string.format("|cff%02x%02x%02x%s|r", r*255, g*255, b*255, target.value)
-                    else
-                        targetText = target.value
-                    end
-                    targetText = "Tank: "..targetText
-                elseif target.type == "group" then
-                    targetText = "|cff55ccff"..target.value.."|r"
-                elseif target.type == "custom" then
-                    targetText = "|cffcccccc"..target.value.."|r"
-                end
-                table.insert(lines, "  "..targetText)
-                break
-            end
-        end
-    end
-
-    if not found then
-        table.insert(lines, "|cff888888No assignments for you.|r")
-    end
-
-    content:SetText(table.concat(lines, "\n"))
-
-    -- Calculate height based on actual font size and number of lines
-    local numLines = table.getn(lines)
-    local lineSpacing = fontSize + 4
-    local newH = 20 + (numLines * lineSpacing) + 10
-    
-    if newH < 50 then newH = 50 end
-    assignFrame:SetHeight(newH)
-end
-
-local function CreateAssignFrame()
-    if assignFrame then return end
-
-    local f = CreateFrame("Frame", "HealAssignAssignFrame", UIParent)
-    f:SetWidth(200)
-    f:SetHeight(80)
-    f:SetPoint("CENTER", UIParent, "CENTER", 300, 200)
-    f:SetMovable(true)
-    f:EnableMouse(true)
-    f:RegisterForDrag("LeftButton")
-    f:SetScript("OnDragStart", function() this:StartMoving() end)
-    f:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
-    f:SetFrameStrata("MEDIUM")
-    f:SetBackdrop({
-        bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
-        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-        tile=true, tileSize=8, edgeSize=8,
-        insets={left=2,right=2,top=2,bottom=2}
-    })
-    f:SetBackdropColor(0.05, 0.05, 0.1, 0.88)
-
-    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    title:SetPoint("TOPLEFT", f, "TOPLEFT", 6, -5)
-    title:SetTextColor(0.4, 0.8, 1)
-    title:SetText("My Assignments")
-
-    local content = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    content:SetPoint("TOPLEFT", f, "TOPLEFT", 8, -20) -- Slightly lower to clear title
-    content:SetPoint("TOPRIGHT", f, "TOPRIGHT", -8, -20)
-    content:SetJustifyH("LEFT")
-    content:SetJustifyV("TOP")
-    
-    -- Apply the font size immediately on creation
-    local fontSize = (HealAssignDB.options and HealAssignDB.options.fontSize) or 12
-    content:SetFont("Fonts\\FRIZQT__.TTF", fontSize, "OUTLINE")
-    content:SetText("|cff888888Waiting for sync...|r")
-    
-    f.content = content
-    assignFrame = f
-
-    if HealAssignDB.options and HealAssignDB.options.showAssignFrame then
-        f:Show()
-        UpdateAssignFrame() -- Initial update
-    else
-        f:Hide()
-    end
-end
-
--------------------------------------------------------------------------------
--- MAIN FRAME UI
--------------------------------------------------------------------------------
-local MAIN_W = 520
-local MAIN_H = 500
-local ROW_H = 22
-local INDENT_HEALER = 20
-
-local function RebuildMainRows()
-    for _, row in ipairs(templateRows) do
-        row:Hide()
-    end
-    templateRows = {}
-
-    if not currentTemplate then return end
-    if not mainFrame then return end
-
-    local scrollChild = mainFrame.scrollChild
-    local yOffset = -5
-
-    for ti, target in ipairs(currentTemplate.targets) do
-        -- Target row background
-        local targetRow = CreateFrame("Frame", nil, scrollChild)
-        targetRow:SetHeight(ROW_H)
-        targetRow:SetPoint("TOPLEFT", scrollChild, "TOPLEFT", 5, yOffset)
-        targetRow:SetPoint("RIGHT", scrollChild, "RIGHT", -5, 0)
-        table.insert(templateRows, targetRow)
-
-        -- Colored background for target row
-        local bg = targetRow:CreateTexture(nil, "BACKGROUND")
-        bg:SetAllPoints()
-        if target.type == "tank" then
-            bg:SetTexture(0.2, 0.1, 0.05, 0.4)
-        elseif target.type == "group" then
-            bg:SetTexture(0.05, 0.1, 0.2, 0.4)
-        else
-            bg:SetTexture(0.1, 0.1, 0.1, 0.4)
-        end
-
-        -- Target label
-        local targetLabel = targetRow:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        targetLabel:SetPoint("LEFT", targetRow, "LEFT", 4, 0)
-        targetLabel:SetWidth(220)
-        targetLabel:SetJustifyH("LEFT")
-
-        local displayText = ""
-        if target.type == "tank" then
-            local cls = GetPlayerClass(target.value)
-            if cls then
-                local r, g, b = GetClassColor(cls)
-                displayText = string.format("|cff%02x%02x%02x[Tank] %s|r", r*255, g*255, b*255, target.value)
-            else
-                displayText = "|cffcc8844[Tank]|r "..target.value
-            end
-        elseif target.type == "group" then
-            displayText = "|cff55ccff[Group] "..target.value.."|r"
-        elseif target.type == "custom" then
-            displayText = "|cffaaaaaa[Custom] "..target.value.."|r"
-        end
-        targetLabel:SetText(displayText)
-
-        -- Add Healer button
-        local addHealerBtn = CreateFrame("Button", nil, targetRow, "UIPanelButtonTemplate")
-        addHealerBtn:SetWidth(90)
-        addHealerBtn:SetHeight(18)
-        addHealerBtn:SetPoint("LEFT", targetLabel, "RIGHT", 5, 0)
-        addHealerBtn:SetText("Add Healer")
-        --addHealerBtn:SetNormalFontObject(GameFontNormalSmall)
-
-        local capturedTI = ti
-        addHealerBtn:SetScript("OnClick", function()
-            local members = GetRaidMembers()
-            local items = {}
-            local HEALER_CLASSES = {PRIEST=true, DRUID=true, SHAMAN=true, PALADIN=true}
-            for _, m in ipairs(members) do
-                if HEALER_CLASSES[m.class] then
-                    local r, g, b = GetClassColor(m.class)
-                    table.insert(items, {text=m.name, name=m.name, class=m.class, r=r, g=g, b=b})
-                end
-            end
-            if table.getn(items) == 0 then
-                table.insert(items, {text="(No healers in raid)", name=nil, r=0.5,g=0.5,b=0.5})
-            end
-            ShowDropdown(addHealerBtn, items, function(item)
-                if item.name then
-                    local already = false
-                    for _, h in ipairs(currentTemplate.targets[capturedTI].healers) do
-                        if h == item.name then already = true end
-                    end
-                    if not already then
-                        table.insert(currentTemplate.targets[capturedTI].healers, item.name)
-                        --SaveCurrentTemplate()
-                        RebuildMainRows()
-                    end
-                end
-            end, 180)
-        end)
-
-        -- Remove target button
-        local removeTargetBtn = CreateFrame("Button", nil, targetRow, "UIPanelButtonTemplate")
-        removeTargetBtn:SetWidth(22)
-        removeTargetBtn:SetHeight(18)
-        removeTargetBtn:SetPoint("RIGHT", targetRow, "RIGHT", -2, 0)
-        removeTargetBtn:SetText("X")
-        --removeTargetBtn:SetNormalFontObject(GameFontNormalSmall)
-        local capturedTI2 = ti
-        removeTargetBtn:SetScript("OnClick", function()
-            table.remove(currentTemplate.targets, capturedTI2)
-            --SaveCurrentTemplate()
-            RebuildMainRows()
-        end)
-
-        yOffset = yOffset - ROW_H
-
-        -- Healer rows
-        for hi, healer in ipairs(target.healers) do
-            local healerRow = CreateFrame("Frame", nil, scrollChild)
-            healerRow:SetHeight(ROW_H - 4)
-            healerRow:SetPoint("TOPLEFT", scrollChild, "TOPLEFT", INDENT_HEALER, yOffset)
-            healerRow:SetPoint("RIGHT", scrollChild, "RIGHT", -5, 0)
-            table.insert(templateRows, healerRow)
-
-            local healerLabel = healerRow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-            healerLabel:SetPoint("LEFT", healerRow, "LEFT", 4, 0)
-            healerLabel:SetWidth(220)
-            healerLabel:SetJustifyH("LEFT")
-
-            local cls = GetPlayerClass(healer)
-            local htext = ""
-            if cls then
-                local r, g, b = GetClassColor(cls)
-                htext = string.format("|cff%02x%02x%02x  -> %s|r", r*255, g*255, b*255, healer)
-            else
-                htext = "  -> "..healer
-            end
-            healerLabel:SetText(htext)
-
-            -- Remove healer button
-            local removeHealerBtn = CreateFrame("Button", nil, healerRow, "UIPanelButtonTemplate")
-            removeHealerBtn:SetWidth(22)
-            removeHealerBtn:SetHeight(16)
-            removeHealerBtn:SetPoint("RIGHT", healerRow, "RIGHT", -2, 0)
-            removeHealerBtn:SetText("X")
-            
-            -- Fix: Use direct local variables for the closure to ensure correct indexing
-            local targetIndex = ti
-            local healerIndex = hi
-            
-            removeHealerBtn:SetScript("OnClick", function()
-                if currentTemplate and currentTemplate.targets[targetIndex] then
-                    table.remove(currentTemplate.targets[targetIndex].healers, healerIndex)
-                    --SaveCurrentTemplate()
-                    RebuildMainRows()
-                end
-            end)
-
-            yOffset = yOffset - (ROW_H - 4)
-        end
-
-        -- Small gap between targets
-        yOffset = yOffset - 4
-    end
-
-    local totalH = math.abs(yOffset) + 20
-    if totalH < 200 then totalH = 200 end
-    scrollChild:SetHeight(totalH)
-end
-
-local function CreateMainFrame()
-    if mainFrame then
-        mainFrame:Show()
-        return
-    end
-
-    local f = CreateFrame("Frame", "HealAssignMainFrame", UIParent)
-    f:SetWidth(MAIN_W)
-    f:SetHeight(MAIN_H)
-    f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
-    f:SetMovable(true)
-    f:EnableMouse(true)
-    f:RegisterForDrag("LeftButton")
-    f:SetScript("OnDragStart", function() this:StartMoving() end)
-    f:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
-    f:SetFrameStrata("MEDIUM")
-    f:SetBackdrop({
-        bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
-        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-        tile=true, tileSize=32, edgeSize=32,
-        insets={left=8,right=8,top=8,bottom=8}
-    })
-    f:SetBackdropColor(0.08, 0.08, 0.14, 0.96)
-
-    -- Title
-    local titleText = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    titleText:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -14)
-    titleText:SetText("|cff00ccffHealAssign|r v"..ADDON_VERSION)
-
-    -- Close button
-    local closeBtn = CreateFrame("Button", nil, f, "UIPanelCloseButton")
-    closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -4, -4)
-    closeBtn:SetScript("OnClick", function()
-        f:Hide()
-        CloseDropdown()
-    end)
-
--------------------------------------------------------------------------------
--- ROW 1: NEW / LOAD / SAVE / RESET / DELETE
--------------------------------------------------------------------------------
-
--- Helper for deep copying tables
-local function DeepCopy(orig)
-    local orig_type = type(orig)
-    local copy
-    if orig_type == 'table' then
-        copy = {}
-        for orig_key, orig_value in next, orig, nil do
-            copy[DeepCopy(orig_key)] = DeepCopy(orig_value)
-        end
-        setmetatable(copy, DeepCopy(getmetatable(orig)))
-    else
-        copy = orig
-    end
+function DeepCopy(orig)
+    local t = type(orig)
+    if t ~= "table" then return orig end
+    local copy = {}
+    for k,v in pairs(orig) do copy[DeepCopy(k)] = DeepCopy(v) end
     return copy
 end
 
--- Helper to check if current workspace differs from the saved database entry
-local function IsCurrentTemplateDirty()
-    if not currentTemplate or table.getn(currentTemplate.targets) == 0 then 
-        return false 
+-------------------------------------------------------------------------------
+-- DATABASE INIT
+-------------------------------------------------------------------------------
+local function InitDB()
+    if not HealAssignDB then HealAssignDB = {} end
+    if not HealAssignDB.templates then HealAssignDB.templates = {} end
+    if not HealAssignDB.activeTemplate then HealAssignDB.activeTemplate = nil end
+    if not HealAssignDB.options then
+        HealAssignDB.options = {
+            fontSize        = 12,
+            showAssignFrame = false,
+            windowAlpha     = 0.95,
+            customTargets   = {},
+        }
     end
-    
-    local name = f.nameEdit:GetText()
-    local saved = HealAssignDB.templates[name]
-    
-    -- If no saved template exists but workspace has targets, it's dirty
-    if not saved then return true end
-    
-    -- Compare name of template
-    if currentTemplate.name ~= saved.name then return true end
-    
-    -- Compare number of targets
-    if table.getn(currentTemplate.targets) ~= table.getn(saved.targets) then
-        return true
-    end
-    
-    -- Deep comparison of targets and their healers
-    for i, target in ipairs(currentTemplate.targets) do
-        local sTarget = saved.targets[i]
-        -- FIX: Changed .name to .value and added .type check
-        if not sTarget then return true end
-        if target.type ~= sTarget.type then return true end
-        if target.value ~= sTarget.value then return true end
-        
-        if table.getn(target.healers) ~= table.getn(sTarget.healers) then return true end
-        
-        for j, healer in ipairs(target.healers) do
-            if healer ~= sTarget.healers[j] then return true end
-        end
-    end
-    
-    return false
+    if not HealAssignDB.options.customTargets  then HealAssignDB.options.customTargets = {} end
+    if not HealAssignDB.options.fontSize       then HealAssignDB.options.fontSize = 12 end
+    if HealAssignDB.options.showAssignFrame == nil then HealAssignDB.options.showAssignFrame = false end
+    if HealAssignDB.options.windowAlpha == nil then HealAssignDB.options.windowAlpha = 0.95 end
 end
 
--- Helper for tooltips
+local function NewTemplate(name)
+    return { name=name or "", roster={}, healers={} }
+end
+
+-------------------------------------------------------------------------------
+-- TOOLTIP HELPER
+-------------------------------------------------------------------------------
 local function AddTooltip(frame, text)
     frame:SetScript("OnEnter", function()
         GameTooltip:SetOwner(frame, "ANCHOR_RIGHT")
@@ -896,503 +87,1814 @@ local function AddTooltip(frame, text)
     frame:SetScript("OnLeave", function() GameTooltip:Hide() end)
 end
 
-local nameLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-nameLabel:SetPoint("TOP", f, "TOP", -155, -42) 
-nameLabel:SetText("Template:")
-
-local nameEdit = CreateFrame("EditBox", "HealAssignNameEdit", f, "InputBoxTemplate")
-nameEdit:SetWidth(80)
-nameEdit:SetHeight(20)
-nameEdit:SetPoint("LEFT", nameLabel, "RIGHT", 5, 0)
-nameEdit:SetAutoFocus(false)
-nameEdit:SetMaxLetters(64)
-f.nameEdit = nameEdit
-
--- 1. NEW (Updated with IsCurrentTemplateDirty check)
-local newBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-newBtn:SetWidth(36)
-newBtn:SetHeight(20)
-newBtn:SetPoint("LEFT", nameEdit, "RIGHT", 5, 0)
-newBtn:SetText("New")
-AddTooltip(newBtn, "Clear workspace and name to start a fresh template.")
-newBtn:SetScript("OnClick", function()
-    if IsCurrentTemplateDirty() then
-        StaticPopup_Show("HEALASSIGN_SAVE_BEFORE_NEW")
-    else
-        currentTemplate = { name = "", targets = {} }
-        HealAssignDB.activeTemplate = nil
-        f.nameEdit:SetText("")
-        if type(RebuildMainRows) == "function" then RebuildMainRows() end
-        if type(UpdateAssignFrame) == "function" then UpdateAssignFrame() end
+-------------------------------------------------------------------------------
+-- DIRTY CHECK (unsaved changes)
+-------------------------------------------------------------------------------
+local function IsCurrentTemplateDirty()
+    if not currentTemplate then return false end
+    -- No healers = nothing to lose
+    if table.getn(currentTemplate.healers or {}) == 0 then return false end
+    local name = currentTemplate.name or ""
+    -- No name = definitely unsaved
+    if name == "" then return true end
+    local saved = HealAssignDB.templates[name]
+    if not saved then return true end
+    -- Compare healer count
+    if table.getn(currentTemplate.healers) ~= table.getn(saved.healers or {}) then return true end
+    -- Compare targets per healer
+    for i,h in ipairs(currentTemplate.healers) do
+        local sh = saved.healers[i]
+        if not sh then return true end
+        if table.getn(h.targets or {}) ~= table.getn(sh.targets or {}) then return true end
     end
-end)
-
--- 2. LOAD
-local loadBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-loadBtn:SetWidth(40)
-loadBtn:SetHeight(20)
-loadBtn:SetPoint("LEFT", newBtn, "RIGHT", 3, 0)
-loadBtn:SetText("Load")
-AddTooltip(loadBtn, "Load an existing template. Click again to close menu.")
-loadBtn:SetScript("OnClick", function()
-    local items = {}
-    for tname, _ in pairs(HealAssignDB.templates) do
-        table.insert(items, {text=tname, name=tname, r=1,g=0.9,b=0.5})
-    end
-    table.sort(items, function(a,b) return a.text < b.text end)
-    
-    if table.getn(items) == 0 then
-        table.insert(items, {text="(No templates)", name=nil, r=0.5,g=0.5,b=0.5})
-    end
-    
-    ShowDropdown(loadBtn, items, function(item)
-        if item.name then
-            currentTemplate = DeepCopy(HealAssignDB.templates[item.name])
-            HealAssignDB.activeTemplate = item.name
-            f.nameEdit:SetText(currentTemplate.name)
-            if type(RebuildMainRows) == "function" then RebuildMainRows() end
-            if type(UpdateAssignFrame) == "function" then UpdateAssignFrame() end
-        end
-    end, 180)
-end)
-
--- 3. SAVE
-local saveBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-saveBtn:SetWidth(40)
-saveBtn:SetHeight(20)
-saveBtn:SetPoint("LEFT", loadBtn, "RIGHT", 3, 0)
-saveBtn:SetText("Save")
-AddTooltip(saveBtn, "Save current assignments to the database.")
-saveBtn:SetScript("OnClick", function()
-    local name = f.nameEdit:GetText()
-    if not name or name == "" then
-        DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Enter a name first.")
-        return
-    end
-    if not currentTemplate then currentTemplate = { name = name, targets = {} } end
-    currentTemplate.name = name
-    HealAssignDB.templates[name] = DeepCopy(currentTemplate)
-    HealAssignDB.activeTemplate = name
-    DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r '"..name.."' saved.")
-    if type(RebuildMainRows) == "function" then RebuildMainRows() end
-end)
-
--- 4. RESET
-local resetBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-resetBtn:SetWidth(42)
-resetBtn:SetHeight(20)
-resetBtn:SetPoint("LEFT", saveBtn, "RIGHT", 3, 0)
-resetBtn:SetText("Reset")
-AddTooltip(resetBtn, "Clear all assignments but keep the template name.")
-resetBtn:SetScript("OnClick", function()
-    if currentTemplate then
-        currentTemplate.targets = {}
-        if type(RebuildMainRows) == "function" then RebuildMainRows() end
-        if type(UpdateAssignFrame) == "function" then UpdateAssignFrame() end
-        DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Assignments reset.")
-    end
-end)
-
--- 5. DELETE
-local delBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-delBtn:SetWidth(32)
-delBtn:SetHeight(20)
-delBtn:SetPoint("LEFT", resetBtn, "RIGHT", 3, 0)
-delBtn:SetText("Del")
-AddTooltip(delBtn, "Permanently delete this template.")
-delBtn:SetScript("OnClick", function()
-    local name = f.nameEdit:GetText()
-    if name and name ~= "" and HealAssignDB.templates[name] then
-        StaticPopup_Show("HEALASSIGN_CONFIRM_DELETE", name)
-    else
-        DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Invalid template.")
-    end
-end)
+    return false
+end
 
 -------------------------------------------------------------------------------
-    -- Row 2: Toolbar buttons (Centered via TOP anchor)
-    -------------------------------------------------------------------------------
-    local toolY = -68
-    local btnH = 22
-    local btnSpacing = 4
-    
-    -- The total width of all buttons + spacing is 428px.
-    -- To center it, the first button must start at -(428/2) + (first_button_width/2)
-    -- Calculation: -214 + 44 = -170
-    local startOffset = -170
+-- STATIC POPUP DIALOGS
+-------------------------------------------------------------------------------
+-- nameEdit reference stored here after CreateMainFrame runs
+local _nameEditRef = nil
+-- Forward-declared references set after the real functions are defined
+local _RebuildMainGrid       = nil
+local _UpdateAssignFrame     = nil
+local _SyncHealersFromRoster = nil
+local _RebuildRosterRows     = nil
 
-    -- Add Tank
-    local addTankBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    addTankBtn:SetWidth(88)
-    addTankBtn:SetHeight(btnH)
-    -- We anchor to "TOP" (center) instead of "TOPLEFT"
-    addTankBtn:SetPoint("TOP", f, "TOP", startOffset, toolY)
-    addTankBtn:SetText("Add Tank")
-    addTankBtn:SetScript("OnClick", function()
-        if not currentTemplate then
-            DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Create or load a template first.")
-            return
+local function _DoNewTemplate()
+    local newTmpl = NewTemplate("")
+    if currentTemplate and currentTemplate.roster then
+        for pname,pdata in pairs(currentTemplate.roster) do
+            newTmpl.roster[pname] = {class=pdata.class, tagT=pdata.tagT, tagH=pdata.tagH, tagV=pdata.tagV}
         end
-        local members = GetRaidMembers()
-        local items = {}
-        for _, m in ipairs(members) do
-            if HealAssignDB.options.tankClasses[m.class] then
-                local r, g, b = GetClassColor(m.class)
-                table.insert(items, {text=m.name, name=m.name, class=m.class, r=r, g=g, b=b})
+        if _SyncHealersFromRoster then _SyncHealersFromRoster(newTmpl) end
+    end
+    currentTemplate = newTmpl
+    HealAssignDB.activeTemplate = nil
+    if _nameEditRef then _nameEditRef:SetText("") end
+    if _RebuildMainGrid   then _RebuildMainGrid() end
+    if _UpdateAssignFrame then _UpdateAssignFrame() end
+end
+
+local function InitStaticPopups()
+    StaticPopupDialogs["HEALASSIGN_CONFIRM_DELETE"] = {
+        text = "Delete template '%s'? This cannot be undone.",
+        button1 = "Delete",
+        button2 = "Cancel",
+        OnAccept = function()
+            local name = _nameEditRef and _nameEditRef:GetText() or ""
+            if name ~= "" and HealAssignDB.templates[name] then
+                HealAssignDB.templates[name] = nil
+                if HealAssignDB.activeTemplate == name then
+                    HealAssignDB.activeTemplate = nil
+                end
+                currentTemplate = NewTemplate("")
+                if _nameEditRef then _nameEditRef:SetText("") end
+                if _RebuildMainGrid   then _RebuildMainGrid() end
+                if _UpdateAssignFrame then _UpdateAssignFrame() end
+                if rosterFrame and _RebuildRosterRows then _RebuildRosterRows() end
+                DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Template '"..name.."' deleted.")
+            end
+        end,
+        timeout = 0, whileDead = true, hideOnEscape = true,
+    }
+
+    StaticPopupDialogs["HEALASSIGN_SAVE_BEFORE_NEW"] = {
+        text = "Current template has unsaved changes. Save before creating a new one?",
+        button1 = "Save",
+        button2 = "Cancel",
+        OnAccept = function()
+            -- Save current then create new
+            local name = _nameEditRef and _nameEditRef:GetText() or ""
+            if name == "" then
+                DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Enter a template name first.")
+                return
+            end
+            if not currentTemplate then currentTemplate = NewTemplate(name) end
+            currentTemplate.name = name
+            HealAssignDB.templates[name] = DeepCopy(currentTemplate)
+            HealAssignDB.activeTemplate = name
+            DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Saved '"..name.."'.")
+            _DoNewTemplate()
+        end,
+        timeout = 0, whileDead = true, hideOnEscape = true,
+    }
+end
+
+-------------------------------------------------------------------------------
+-- UTILITY
+-------------------------------------------------------------------------------
+local function GetClassColor(class)
+    local c = CLASS_COLORS[class]
+    if c then return c.r, c.g, c.b end
+    return 1,1,1
+end
+
+local function GetRaidMembers()
+    local members = {}
+    local numRaid = GetNumRaidMembers()
+    if numRaid and numRaid > 0 then
+        for i=1,numRaid do
+            local name,rank,subgroup,level,class,fileName,zone,online = GetRaidRosterInfo(i)
+            if name then
+                table.insert(members, {name=name, class=fileName or class, rank=rank, subgroup=subgroup, online=online})
             end
         end
-        if table.getn(items) == 0 then
-            for _, m in ipairs(members) do
-                local r, g, b = GetClassColor(m.class)
-                table.insert(items, {text=m.name, name=m.name, class=m.class, r=r, g=g, b=b})
+    else
+        local pname = UnitName("player")
+        local _,pclass = UnitClass("player")
+        if pname then table.insert(members, {name=pname, class=pclass, rank=2, subgroup=1, online=true}) end
+        local numParty = GetNumPartyMembers()
+        if numParty and numParty > 0 then
+            for i=1,numParty do
+                local mname = UnitName("party"..i)
+                local _,mclass = UnitClass("party"..i)
+                if mname then table.insert(members, {name=mname, class=mclass, rank=0, subgroup=1, online=true}) end
             end
         end
-        if table.getn(items) == 0 then
-            table.insert(items, {text="(No raid members)", name=nil, r=0.5,g=0.5,b=0.5})
-        end
-        ShowDropdown(addTankBtn, items, function(item)
-            if item.name then
-                table.insert(currentTemplate.targets, {type="tank", value=item.name, healers={}})
-                -- SaveCurrentTemplate() removed to prevent silent auto-save
-                RebuildMainRows()
-            end
-        end, 180)
-    end)
+    end
+    table.sort(members, function(a,b) return a.name < b.name end)
+    return members
+end
 
-    -- Add Group
-    local addGroupBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    addGroupBtn:SetWidth(88)
-    addGroupBtn:SetHeight(btnH)
-    -- Anchor to the right of the previous button
-    addGroupBtn:SetPoint("LEFT", addTankBtn, "RIGHT", btnSpacing, 0)
-    addGroupBtn:SetText("Add Group")
-    addGroupBtn:SetScript("OnClick", function()
-        if not currentTemplate then
-            DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Create or load a template first.")
-            return
-        end
-        local items = {}
-        for i = 1, 8 do
-            table.insert(items, {text="Group "..i, value="Group "..i, r=0.4, g=0.8, b=1.0})
-        end
-        ShowDropdown(addGroupBtn, items, function(item)
-            table.insert(currentTemplate.targets, {type="group", value=item.value, healers={}})
-            -- SaveCurrentTemplate() removed to prevent silent auto-save
-            RebuildMainRows()
-        end, 120)
-    end)
+local function IsRaidLeader()
+    local myName = UnitName("player")
+    local numRaid = GetNumRaidMembers()
+    if not numRaid or numRaid == 0 then return false end
+    for i=1,numRaid do
+        local name,rank = GetRaidRosterInfo(i)
+        if name == myName and rank == 2 then return true end
+    end
+    return false
+end
 
-    -- Add Custom
-    local addCustomBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    addCustomBtn:SetWidth(92)
-    addCustomBtn:SetHeight(btnH)
-    addCustomBtn:SetPoint("LEFT", addGroupBtn, "RIGHT", btnSpacing, 0)
-    addCustomBtn:SetText("Add Custom")
-    addCustomBtn:SetScript("OnClick", function()
-        if not currentTemplate then
-            DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Create or load a template first.")
-            return
-        end
-        local items = {}
-        for _, ct in ipairs(HealAssignDB.options.customTargets) do
-            table.insert(items, {text=ct, value=ct, r=0.8, g=0.8, b=0.8})
-        end
-        if table.getn(items) == 0 then
-            table.insert(items, {text="(Add custom targets in Options)", value=nil, r=0.5,g=0.5,b=0.5})
-        end
-        ShowDropdown(addCustomBtn, items, function(item)
-            if item.value then
-                table.insert(currentTemplate.targets, {type="custom", value=item.value, healers={}})
-                -- SaveCurrentTemplate() removed to prevent silent auto-save
-                RebuildMainRows()
-            end
-        end, 210)
-    end)
+local function HasEditorRights()
+    local numRaid = GetNumRaidMembers()
+    if not numRaid or numRaid == 0 then return false end
+    local myName = UnitName("player")
+    for i=1,numRaid do
+        local name,rank = GetRaidRosterInfo(i)
+        if name == myName and rank >= 1 then return true end
+    end
+    return false
+end
 
-    -- Options button
-    local optionsBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    optionsBtn:SetWidth(72)
-    optionsBtn:SetHeight(btnH)
-    optionsBtn:SetPoint("LEFT", addCustomBtn, "RIGHT", btnSpacing, 0)
-    optionsBtn:SetText("Options")
-    optionsBtn:SetScript("OnClick", function()
+local function GetTargetDisplayText(target)
+    if target.type == TYPE_GROUP  then return "Group "..target.value end
+    if target.type == TYPE_TANK   then return "[Tank] "..target.value end
+    if target.type == TYPE_CUSTOM then return target.value end
+    return target.value or "?"
+end
+
+-------------------------------------------------------------------------------
+-- TEMPLATE STATE
+-------------------------------------------------------------------------------
+currentTemplate = nil
+
+local function GetActiveTemplate()
+    if currentTemplate then
+        if not currentTemplate.roster  then currentTemplate.roster  = {} end
+        if not currentTemplate.healers then currentTemplate.healers = {} end
+    end
+    return currentTemplate
+end
+
+local function SyncHealersFromRoster(tmpl)
+    local existing = {}
+    for _,h in ipairs(tmpl.healers) do existing[h.name] = h end
+
+    local hNames = {}
+    for pname,pdata in pairs(tmpl.roster) do
+        if pdata.tagH then table.insert(hNames, pname) end
+    end
+    table.sort(hNames)
+
+    local newHealers = {}
+    for _,pname in ipairs(hNames) do
+        if existing[pname] then
+            table.insert(newHealers, existing[pname])
+        else
+            table.insert(newHealers, {name=pname, targets={}})
+        end
+    end
+    tmpl.healers = newHealers
+end
+
+-------------------------------------------------------------------------------
+-- FRAME REFERENCES
+-------------------------------------------------------------------------------
+local mainFrame    = nil
+local rosterFrame  = nil
+local assignFrame  = nil
+local optionsFrame = nil
+local rlFrame      = nil
+local alertFrame   = nil
+
+-------------------------------------------------------------------------------
+-- DROPDOWN
+-------------------------------------------------------------------------------
+local dropdownFrame        = nil
+local dropdownLocker       = nil
+local activeDropdownAnchor = nil
+
+local function CloseDropdown()
+    if dropdownFrame and dropdownFrame:IsShown() then
+        dropdownFrame:Hide()
+        if dropdownLocker then dropdownLocker:Hide() end
+        activeDropdownAnchor = nil
+    end
+end
+
+local function ShowDropdown(anchorFrame, items, onSelect, width)
+    if dropdownFrame and dropdownFrame:IsShown() and activeDropdownAnchor == anchorFrame then
         CloseDropdown()
-        if optionsFrame then
-            if optionsFrame:IsShown() then
-                optionsFrame:Hide()
-            else
-                optionsFrame:Show()
-            end
+        return
+    end
+    CloseDropdown()
+
+    if not dropdownLocker then
+        dropdownLocker = CreateFrame("Button","HealAssignDropdownLocker",UIParent)
+        dropdownLocker:SetAllPoints(UIParent)
+        dropdownLocker:SetFrameStrata("DIALOG")
+        dropdownLocker:SetScript("OnClick", CloseDropdown)
+    end
+
+    if not dropdownFrame then
+        dropdownFrame = CreateFrame("Frame","HealAssignDropdownFrame",UIParent)
+        dropdownFrame:SetFrameStrata("TOOLTIP")
+        dropdownFrame:SetBackdrop({
+            bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+            tile=true, tileSize=8, edgeSize=8,
+            insets={left=2,right=2,top=2,bottom=2}
+        })
+        dropdownFrame:SetBackdropColor(0.08,0.08,0.12,0.97)
+        dropdownFrame.buttons = {}
+    end
+
+    local f   = dropdownFrame
+    activeDropdownAnchor = anchorFrame
+    dropdownLocker:Show()
+
+    for _,b in ipairs(f.buttons) do b:Hide() end
+
+    local itemH = 22
+    local pad   = 4
+    local w     = width or 160
+    local h     = table.getn(items)*itemH + pad*2
+    if h < 24 then h = 24 end
+
+    f:SetWidth(w)
+    f:SetHeight(h)
+    f:ClearAllPoints()
+    f:SetPoint("TOPLEFT", anchorFrame, "BOTTOMLEFT", 0, -2)
+
+    for i,item in ipairs(items) do
+        local btn = f.buttons[i]
+        if not btn then
+            btn = CreateFrame("Button",nil,f)
+            btn:SetHeight(itemH)
+            btn:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight")
+            btn:GetHighlightTexture():SetAlpha(0.4)
+
+            local ic = btn:CreateTexture(nil,"OVERLAY")
+            ic:SetWidth(14)
+            ic:SetHeight(14)
+            ic:SetPoint("LEFT",btn,"LEFT",4,0)
+            btn.icon = ic
+
+            local fs = btn:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
+            fs:SetPoint("LEFT",btn,"LEFT",22,0)
+            fs:SetPoint("RIGHT",btn,"RIGHT",-4,0)
+            fs:SetJustifyH("LEFT")
+            btn.label = fs
+            f.buttons[i] = btn
         end
-    end)
 
-    -- Sync button
-    local syncBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    syncBtn:SetWidth(72)
-    syncBtn:SetHeight(btnH)
-    syncBtn:SetPoint("LEFT", optionsBtn, "RIGHT", btnSpacing, 0)
-    syncBtn:SetText("Sync Raid")
-    syncBtn:SetScript("OnClick", function()
-        HealAssign_SyncTemplate()
-    end)
+        btn:ClearAllPoints()
+        btn:SetPoint("TOPLEFT",f,"TOPLEFT",pad,-(pad+(i-1)*itemH))
+        btn:SetWidth(w-pad*2)
+        btn:Show()
 
-    -- Separator line
-    local sep = f:CreateTexture(nil, "ARTWORK")
-    sep:SetHeight(1)
-    sep:SetPoint("TOPLEFT", f, "TOPLEFT", 12, toolY - btnH - 4)
-    sep:SetPoint("TOPRIGHT", f, "TOPRIGHT", -12, toolY - btnH - 4)
-    sep:SetTexture(0.3, 0.3, 0.4, 0.8)
+        btn.label:ClearAllPoints()
+        btn.label:SetPoint("RIGHT",btn,"RIGHT",-4,0)
+        if item.icon then
+            btn.icon:SetTexture(item.icon)
+            btn.icon:SetWidth(16)
+            btn.icon:SetHeight(16)
+            btn.icon:Show()
+            btn.label:SetPoint("LEFT",btn,"LEFT",24,0)
+        else
+            btn.icon:SetTexture(nil)
+            btn.icon:Hide()
+            btn.label:SetPoint("LEFT",btn,"LEFT",6,0)
+        end
 
-    -- Scroll frame
-    local scrollFrame = CreateFrame("ScrollFrame", "HealAssignScrollFrame", f, "FauxScrollFrameTemplate")
-    scrollFrame:SetPoint("TOPLEFT", f, "TOPLEFT", 12, toolY - btnH - 10)
-    scrollFrame:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -28, 36)
+        if item.r then btn.label:SetTextColor(item.r,item.g,item.b)
+        else btn.label:SetTextColor(1,1,1) end
+        btn.label:SetText(item.text or "")
 
-    local scrollChild = CreateFrame("Frame", "HealAssignScrollChild", scrollFrame)
-    scrollChild:SetWidth(MAIN_W - 55)
-    scrollChild:SetHeight(300)
-    scrollFrame:SetScrollChild(scrollChild)
+        local capturedItem = item
+        btn:SetScript("OnClick",function()
+            CloseDropdown()
+            onSelect(capturedItem)
+        end)
+    end
 
-    f.scrollFrame = scrollFrame
-    f.scrollChild = scrollChild
-
-    -- Status bar
-    local statusBar = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    statusBar:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 12, 12)
-    statusBar:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -12, 12)
-    statusBar:SetJustifyH("LEFT")
-    statusBar:SetTextColor(0.6, 0.6, 0.6)
-    statusBar:SetText("/ha sync  |  /ha options  |  /ha assign  |  /ha help")
-    f.statusBar = statusBar
-
-    mainFrame = f
     f:Show()
 end
 
 -------------------------------------------------------------------------------
--- OPTIONS FRAME (Updated with fixed font slider and spacing)
+-- SERIALIZATION
 -------------------------------------------------------------------------------
-local function CreateOptionsFrame()
-    if optionsFrame then
-        optionsFrame:Show()
+local function SplitStr(str, sep)
+    local result = {}
+    local i = 1
+    local last = 1
+    local len = string.len(str)
+    while i <= len do
+        if string.sub(str,i,i) == sep then
+            local part = string.sub(str,last,i-1)
+            if part ~= "" then table.insert(result,part) end
+            last = i+1
+        end
+        i = i+1
+    end
+    local part = string.sub(str,last)
+    if part ~= "" then table.insert(result,part) end
+    return result
+end
+
+local function Serialize(tmpl)
+    local rosterParts = {}
+    for pname,pdata in pairs(tmpl.roster or {}) do
+        local safe = string.gsub(pname,"[|~;:,]","_")
+        local tagStr = (pdata.tagT and "T" or "")..(pdata.tagH and "H" or "")..(pdata.tagV and "V" or "")
+        table.insert(rosterParts, safe..":"..(pdata.class or "")..":"..tagStr)
+    end
+
+    local healerParts = {}
+    for _,h in ipairs(tmpl.healers or {}) do
+        local safeName = string.gsub(h.name or "","[|~;:,]","_")
+        local tStrs = {}
+        for _,t in ipairs(h.targets or {}) do
+            local safeVal = string.gsub(t.value or "","[|~;:,]","_")
+            table.insert(tStrs, t.type..":"..safeVal)
+        end
+        table.insert(healerParts, safeName..";"..table.concat(tStrs,","))
+    end
+
+    return "v2~"..string.gsub(tmpl.name or "","[|~;:,]","_").."~"
+        ..table.concat(rosterParts,"|").."~"
+        ..table.concat(healerParts,"|")
+end
+
+local function Deserialize(str)
+    if not str then return nil end
+    local parts = SplitStr(str,"~")
+    -- parts[1]=v2, parts[2]=name, parts[3]=roster, parts[4]=healers
+    if not parts[1] or parts[1] ~= "v2" then return nil end
+
+    local tmpl = NewTemplate(parts[2] or "")
+
+    if parts[3] and parts[3] ~= "" then
+        local entries = SplitStr(parts[3],"|")
+        for _,entry in ipairs(entries) do
+            local ep = SplitStr(entry,":")
+            if ep[1] and ep[1] ~= "" then
+                local tagStr = ep[3] or ""
+                tmpl.roster[ep[1]] = {
+                    class = ep[2] or "",
+                    tagT  = string.find(tagStr,"T") ~= nil or nil,
+                    tagH  = string.find(tagStr,"H") ~= nil or nil,
+                    tagV  = string.find(tagStr,"V") ~= nil or nil,
+                }
+            end
+        end
+    end
+
+    if parts[4] and parts[4] ~= "" then
+        local hentries = SplitStr(parts[4],"|")
+        for _,hentry in ipairs(hentries) do
+            local semi = string.find(hentry,";")
+            if semi then
+                local hname = string.sub(hentry,1,semi-1)
+                local tstr  = string.sub(hentry,semi+1)
+                local healer = {name=hname, targets={}}
+                if tstr and tstr ~= "" then
+                    local tparts = SplitStr(tstr,",")
+                    for _,tp in ipairs(tparts) do
+                        local colon = string.find(tp,":")
+                        if colon then
+                            table.insert(healer.targets, {
+                                type  = string.sub(tp,1,colon-1),
+                                value = string.sub(tp,colon+1)
+                            })
+                        end
+                    end
+                end
+                table.insert(tmpl.healers, healer)
+            end
+        end
+    end
+
+    return tmpl
+end
+
+-------------------------------------------------------------------------------
+-- DEATH ALERT SYSTEM
+-------------------------------------------------------------------------------
+local deadHealers = {}
+
+-- DBM-style alert: big text center screen, fades after 5 sec
+local function CreateAlertFrame()
+    if alertFrame then return end
+
+    alertFrame = CreateFrame("Frame","HealAssignAlertFrame",UIParent)
+    alertFrame:SetWidth(600)
+    alertFrame:SetHeight(80)
+    alertFrame:SetPoint("TOP",UIParent,"TOP",0,-120)
+    alertFrame:SetFrameStrata("FULLSCREEN_DIALOG")
+    alertFrame:Hide()
+
+    alertFrame:SetBackdrop({
+        bgFile  = "Interface\\DialogFrame\\UI-DialogBox-Background",
+        edgeFile= "Interface\\Tooltips\\UI-Tooltip-Border",
+        tile=true,tileSize=8,edgeSize=10,
+        insets={left=4,right=4,top=4,bottom=4}
+    })
+    alertFrame:SetBackdropColor(0.3,0,0,0.92)
+    alertFrame:SetBackdropBorderColor(1,0.1,0.1,1)
+
+    local header = alertFrame:CreateFontString(nil,"OVERLAY","GameFontNormalHuge")
+    header:SetFont("Fonts\\FRIZQT__.TTF", 22, "OUTLINE")
+    header:SetPoint("TOP",alertFrame,"TOP",0,-10)
+    header:SetTextColor(1,0.1,0.1)
+    alertFrame.header = header
+
+    local sub = alertFrame:CreateFontString(nil,"OVERLAY","GameFontNormal")
+    sub:SetPoint("TOP",header,"BOTTOM",0,-4)
+    sub:SetTextColor(1,0.75,0.1)
+    alertFrame.sub = sub
+
+    -- Fade out timer
+    alertFrame.elapsed = 0
+    alertFrame.duration = 5
+    alertFrame:SetScript("OnUpdate",function()
+        if not alertFrame.active then return end
+        alertFrame.elapsed = alertFrame.elapsed + arg1
+        local pct = alertFrame.elapsed / alertFrame.duration
+        if pct >= 1 then
+            alertFrame.active = false
+            alertFrame:Hide()
+        else
+            local alpha = 1
+            if pct > 0.6 then alpha = 1 - (pct - 0.6) / 0.4 end
+            alertFrame:SetAlpha(alpha)
+        end
+    end)
+
+    alertFrame.rows = {}
+end
+
+local function RefreshAlertFrame()
+    if not alertFrame then return end
+    local now = GetTime()
+    local alive = {}
+    for _,d in ipairs(deadHealers) do
+        if now - d.time < 15 then table.insert(alive,d) end
+    end
+    deadHealers = alive
+    if table.getn(deadHealers) == 0 then
+        alertFrame:Hide()
+    end
+end
+
+local function TriggerHealerDeath(healerName, targets)
+    local myName = UnitName("player")
+    local tmpl = GetActiveTemplate()
+
+    -- Always track in deadHealers (needed for UNATTENDED display)
+    local found = false
+    for _,d in ipairs(deadHealers) do
+        if d.name == healerName then
+            d.time = GetTime()
+            d.targets = DeepCopy(targets or {})
+            found = true
+            break
+        end
+    end
+    if not found then
+        table.insert(deadHealers, {name=healerName, targets=DeepCopy(targets or {}), time=GetTime()})
+    end
+
+    -- Check if local player should see visual alert (tag H or V or RL)
+    local shouldShow = false
+    if tmpl and tmpl.roster and tmpl.roster[myName] then
+        local me = tmpl.roster[myName]
+        if me.tagH or me.tagV then shouldShow = true end
+    end
+    if HasEditorRights and HasEditorRights() then shouldShow = true end
+
+    if not shouldShow then return end
+
+    -- Play sound
+    PlaySoundFile("Interface\\Buttons\\UI-RaidTargetingWarning.wav")
+
+    -- Show DBM-style alert
+    if not alertFrame then CreateAlertFrame() end
+
+    local targetText = "No assigned targets"
+    if table.getn(targets or {}) > 0 then
+        local names = {}
+        for _,t in ipairs(targets) do table.insert(names, GetTargetDisplayText(t)) end
+        targetText = "Unattended:  "..table.concat(names, "   |   ")
+    end
+
+    alertFrame.header:SetText("HEALER DEAD:  "..healerName)
+    alertFrame.sub:SetText("")
+    alertFrame.duration = 7
+    alertFrame.elapsed = 0
+    alertFrame.active = true
+    alertFrame:SetAlpha(1)
+    alertFrame:Show()
+end
+
+-------------------------------------------------------------------------------
+-- ASSIGN FRAME (personal frame showing my targets + unattended)
+-------------------------------------------------------------------------------
+local function UpdateAssignFrame()
+    if not assignFrame then return end
+
+    for _,c in ipairs(assignFrame.content or {}) do c:Hide() end
+    assignFrame.content = {}
+
+    local inRaid = GetNumRaidMembers() > 0
+    local showOutsideRaid = HealAssignDB and HealAssignDB.options and HealAssignDB.options.showAssignFrame
+    if not inRaid and not showOutsideRaid then
+        assignFrame:Hide()
         return
     end
 
-    local f = CreateFrame("Frame", "HealAssignOptionsFrame", UIParent)
-    f:SetWidth(370)
-    f:SetHeight(560) 
-    f:SetPoint("TOPLEFT", UIParent, "CENTER", 20, 100)
-    f:SetMovable(true)
-    f:EnableMouse(true)
-    f:RegisterForDrag("LeftButton")
-    f:SetScript("OnDragStart", function() this:StartMoving() end)
-    f:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
-    f:SetFrameStrata("HIGH")
-    f:SetBackdrop({
+    local myName   = UnitName("player")
+    local tmpl     = GetActiveTemplate()
+    local fontSize = (HealAssignDB.options and HealAssignDB.options.fontSize) or 12
+
+    local myTargets     = {}
+    local myDeadTargets = {}
+
+    -- Check if this player has V tag
+    local isViewer = false
+    if tmpl and tmpl.roster and tmpl.roster[myName] and tmpl.roster[myName].tagV then
+        isViewer = true
+    end
+
+    if tmpl then
+        for _,h in ipairs(tmpl.healers) do
+            if h.name == myName then myTargets = h.targets break end
+        end
+        local deadSet = {}
+        for _,d in ipairs(deadHealers) do deadSet[d.name] = d end
+        for _,d in ipairs(deadHealers) do
+            if d.name ~= myName then
+                for _,t in ipairs(d.targets) do
+                    table.insert(myDeadTargets,{target=t, from=d.name})
+                end
+            end
+        end
+    end
+
+    -- Adjust frame width based on font size
+    local frameW = 130 + (fontSize - 8) * 7
+    if frameW < 120 then frameW = 120 end
+    if frameW > 240 then frameW = 240 end
+    assignFrame:SetWidth(frameW)
+
+    -- Row spacing scales with font size
+    local rowH    = fontSize + 4   -- tight row height
+    local rowStep = fontSize + 5   -- step between rows
+    local titleH  = fontSize + 8   -- title area
+    local yOff    = -(titleH + 2)
+
+    local function AddRow(text, r,g,b, bgR,bgG,bgB)
+        local row = CreateFrame("Frame",nil,assignFrame)
+        row:SetPoint("TOPLEFT",assignFrame,"TOPLEFT",6,yOff)
+        row:SetWidth(assignFrame:GetWidth()-12)
+        row:SetHeight(rowH)
+        if bgR then
+            row:SetBackdrop({bgFile="Interface\\Buttons\\WHITE8X8",insets={left=0,right=0,top=0,bottom=0}})
+            row:SetBackdropColor(bgR,bgG,bgB,0.3)
+        end
+        local fs = row:CreateFontString(nil,"OVERLAY")
+        fs:SetFont("Fonts\\FRIZQT__.TTF",fontSize)
+        fs:SetPoint("LEFT",row,"LEFT",4,0)
+        fs:SetTextColor(r or 1,g or 1,b or 1)
+        fs:SetText(text)
+        yOff = yOff - rowStep
+        table.insert(assignFrame.content,row)
+    end
+
+    -- Get my class color from roster
+    local myClass = nil
+    if tmpl and tmpl.roster and tmpl.roster[myName] then
+        myClass = tmpl.roster[myName].class
+    end
+    if not myClass then
+        local _,c = UnitClass("player")
+        myClass = c
+    end
+    local tr,tg,tb = GetClassColor(myClass)
+
+    local titleFS = assignFrame:CreateFontString(nil,"OVERLAY","GameFontNormal")
+    titleFS:SetPoint("TOP",assignFrame,"TOP",0,-3)
+    titleFS:SetTextColor(tr,tg,tb)
+    titleFS:SetText(isViewer and "Assignments" or myName)
+    table.insert(assignFrame.content,titleFS)
+
+    -- Viewer (V tag): Target -> assigned healers
+    if isViewer and tmpl then
+        local targetOrder,targetMeta,targetHeals,seen = {},{},{},{}
+        for _,h in ipairs(tmpl.healers) do
+            for _,t in ipairs(h.targets) do
+                local key = (t.type or "").."~"..(t.value or "")
+                if not seen[key] then
+                    seen[key]=true
+                    table.insert(targetOrder,key)
+                    targetMeta[key]={display=GetTargetDisplayText(t),ttype=t.type,tvalue=t.value}
+                    targetHeals[key]={}
+                end
+                table.insert(targetHeals[key],h.name)
+            end
+        end
+        if table.getn(targetOrder)==0 then
+            AddRow("  (no assignments)",0.5,0.5,0.5)
+        else
+            for _,key in ipairs(targetOrder) do
+                local m=targetMeta[key]
+                local tr2,tg2,tb2=0.88,0.88,0.88
+                if m.ttype==TYPE_TANK then
+                    if tmpl.roster and tmpl.roster[m.tvalue] then tr2,tg2,tb2=GetClassColor(tmpl.roster[m.tvalue].class) end
+                elseif m.ttype==TYPE_GROUP  then tr2,tg2,tb2=0.5,0.85,1.0
+                elseif m.ttype==TYPE_CUSTOM then tr2,tg2,tb2=0.9,0.6,1.0
+                end
+                AddRow(m.display,tr2,tg2,tb2)
+                for _,hname in ipairs(targetHeals[key]) do
+                    local hr2,hg2,hb2=1,1,1
+                    if tmpl.roster and tmpl.roster[hname] then hr2,hg2,hb2=GetClassColor(tmpl.roster[hname].class) end
+                    -- Red if healer is dead
+                    local isDead = false
+                    for _,dd in ipairs(deadHealers) do if dd.name == hname then isDead=true break end end
+                    if isDead then hr2,hg2,hb2=1,0.1,0.1 end
+                    AddRow("  "..hname,hr2,hg2,hb2)
+                end
+            end
+        end
+        local totalH=math.abs(yOff)+rowStep
+        if totalH<titleH+rowStep then totalH=titleH+rowStep end
+        assignFrame:SetHeight(totalH)
+        assignFrame:Show()
+        return
+    end
+
+    if table.getn(myTargets) == 0 then
+        AddRow("  (none assigned)",0.5,0.5,0.5)
+    else
+        for _,t in ipairs(myTargets) do
+            local dr,dg,db = 1,1,1
+            if t.type == TYPE_TANK then
+                -- Class color for tanks
+                if tmpl and tmpl.roster and tmpl.roster[t.value] then
+                    dr,dg,db = GetClassColor(tmpl.roster[t.value].class)
+                end
+            elseif t.type == TYPE_GROUP  then dr,dg,db = 0.5, 0.85, 1.0
+            elseif t.type == TYPE_CUSTOM then dr,dg,db = 0.9, 0.6,  1.0
+            end
+            AddRow("  "..GetTargetDisplayText(t),dr,dg,db)
+        end
+    end
+
+    if table.getn(myDeadTargets) > 0 then
+        yOff = yOff - 4
+        -- Group targets by dead healer
+        local healerOrder = {}
+        local healerTargets = {}
+        for _,ud in ipairs(myDeadTargets) do
+            if not healerTargets[ud.from] then
+                table.insert(healerOrder, ud.from)
+                healerTargets[ud.from] = {}
+            end
+            table.insert(healerTargets[ud.from], ud.target)
+        end
+        for _,dname in ipairs(healerOrder) do
+            local dr2,dg2,db2 = 1,0.2,0.2
+            if tmpl and tmpl.roster and tmpl.roster[dname] then
+                dr2,dg2,db2 = GetClassColor(tmpl.roster[dname].class)
+            end
+            AddRow("  "..dname.." (dead):", dr2,dg2,db2, 0.35,0,0)
+            for _,t in ipairs(healerTargets[dname]) do
+                local tr2,tg2,tb2 = 1,0.6,0.1
+                if t.type == TYPE_TANK then
+                    if tmpl and tmpl.roster and tmpl.roster[t.value] then
+                        tr2,tg2,tb2 = GetClassColor(tmpl.roster[t.value].class)
+                    end
+                elseif t.type == TYPE_GROUP  then tr2,tg2,tb2 = 0.5,0.85,1.0
+                elseif t.type == TYPE_CUSTOM then tr2,tg2,tb2 = 0.9,0.6,1.0
+                end
+                AddRow("  "..GetTargetDisplayText(t), tr2,tg2,tb2)
+            end
+        end
+    end
+
+    local totalH = math.abs(yOff)+10
+    if totalH < 60 then totalH = 60 end
+    assignFrame:SetHeight(totalH)
+    assignFrame:Show()
+end
+
+local function ApplyWindowAlpha(alpha)
+    alpha = alpha or (HealAssignDB and HealAssignDB.options and HealAssignDB.options.windowAlpha) or 0.95
+    if mainFrame    then mainFrame:SetBackdropColor(0.04,0.04,0.1,alpha)    end
+    if rosterFrame  then rosterFrame:SetBackdropColor(0.04,0.04,0.1,alpha)  end
+    if optionsFrame then optionsFrame:SetBackdropColor(0.04,0.04,0.1,alpha) end
+    if assignFrame  then assignFrame:SetBackdropColor(0.05,0.05,0.1,alpha)  end
+    if rlFrame      then rlFrame:SetBackdropColor(0.03,0.07,0.03,alpha)     end
+end
+
+-- ESC handling: UISpecialFrames only allows one frame at a time.
+-- We swap which frame is registered based on openStack top.
+local function UpdateEscFrame()
+    -- Clear all HA frames from UISpecialFrames
+    local toRemove = {
+        ["HealAssignMainFrame"]=true,
+        ["HealAssignOptionsFrame"]=true,
+        ["HealAssignRosterFrame"]=true,
+    }
+    local i = 1
+    while i <= table.getn(UISpecialFrames) do
+        if toRemove[UISpecialFrames[i]] then
+            table.remove(UISpecialFrames, i)
+        else
+            i = i + 1
+        end
+    end
+    -- Register only the topmost visible window
+    for j = table.getn(openStack), 1, -1 do
+        local f = openStack[j]
+        if f and f:IsShown() and f:GetName() then
+            table.insert(UISpecialFrames, f:GetName())
+            return
+        end
+        table.remove(openStack, j)
+    end
+end
+
+local function PushWindow(f)
+    for i = table.getn(openStack), 1, -1 do
+        if openStack[i] == f then table.remove(openStack, i) end
+    end
+    table.insert(openStack, f)
+    UpdateEscFrame()
+end
+
+-- Hook Hide on each HA frame to update ESC registration
+local function HookFrameHide(f)
+    local orig = f:GetScript("OnHide")
+    f:SetScript("OnHide", function()
+        if orig then orig() end
+        UpdateEscFrame()
+    end)
+end
+
+function HealAssign_OpenOptions()
+    CreateOptionsFrame()
+end
+
+
+local function CreateAssignFrame()
+    if assignFrame then return end
+    assignFrame = CreateFrame("Frame","HealAssignAssignFrame",UIParent)
+    assignFrame:SetWidth(220)
+    assignFrame:SetHeight(100)
+    assignFrame:SetPoint("CENTER",UIParent,"CENTER",400,0)
+    assignFrame:SetMovable(true)
+    assignFrame:EnableMouse(true)
+    assignFrame:RegisterForDrag("LeftButton")
+    assignFrame:SetScript("OnDragStart",function() this:StartMoving() end)
+    assignFrame:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
+    assignFrame:SetFrameStrata("MEDIUM")
+    assignFrame:SetBackdrop({
         bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
         edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-        tile=true, tileSize=32, edgeSize=32,
-        insets={left=8,right=8,top=8,bottom=8}
+        tile=true,tileSize=8,edgeSize=12,
+        insets={left=4,right=4,top=4,bottom=4}
     })
-    f:SetBackdropColor(0.08, 0.08, 0.14, 0.96)
+    local _alpha = (HealAssignDB and HealAssignDB.options and HealAssignDB.options.windowAlpha) or 0.95
+    assignFrame:SetBackdropColor(0.05,0.05,0.1,_alpha)
+    assignFrame:SetBackdropBorderColor(0.3,0.6,1,0.8)
+    assignFrame.content = {}
+    assignFrame:Hide()
 
-    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    title:SetPoint("TOP", f, "TOP", 0, -14)
-    title:SetText("|cff00ccffHealAssign|r - Options")
+    local optBtn = CreateFrame("Button",nil,assignFrame,"UIPanelButtonTemplate")
+    optBtn:SetWidth(24)
+    optBtn:SetHeight(16)
+    optBtn:SetPoint("TOPRIGHT",assignFrame,"TOPRIGHT",-4,-4)
+    optBtn:SetText("O")
+    optBtn:SetScript("OnClick",function()
+        if optionsFrame and optionsFrame:IsShown() then
+            optionsFrame:Hide()
+        else
+            HealAssign_OpenOptions()
+        end
+    end)
+end
 
-    local closeBtn = CreateFrame("Button", nil, f, "UIPanelCloseButton")
-    closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -4, -4)
-    closeBtn:SetScript("OnClick", function() f:Hide() end)
+-------------------------------------------------------------------------------
+-- RAID LEADER READ-ONLY FRAME
+-------------------------------------------------------------------------------
+local function UpdateRLFrame()
+    if not rlFrame then return end
+    for _,c in ipairs(rlFrame.content or {}) do c:Hide() end
+    rlFrame.content = {}
 
-    -- Section: Tank Classes
-    local sec1 = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    sec1:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -42)
-    sec1:SetTextColor(1, 0.8, 0.2)
-    sec1:SetText("Tank Classes (shown in Add Tank dropdown):")
+    local tmpl = GetActiveTemplate()
+    if not tmpl then rlFrame:Hide() return end
 
-    local cbX = 14
-    local cbY = -60
-    local cbPerRow = 3
-    local cbW = 110
-    local cbH = 20
+    local deadSet = {}
+    for _,d in ipairs(deadHealers) do deadSet[d.name] = true end
 
-    for i, cls in ipairs(CLASS_NAMES) do
-        local cb = CreateFrame("CheckButton", "HealAssignCB_"..cls, f, "UICheckButtonTemplate")
-        cb:SetWidth(cbH)
-        cb:SetHeight(cbH)
-        local col = math.mod(i-1, cbPerRow)
-        local row = math.floor((i-1) / cbPerRow)
-        cb:SetPoint("TOPLEFT", f, "TOPLEFT", cbX + col * cbW, cbY - row * (cbH + 2))
+    local yOff = -30
+    local function AddRLRow(text,r,g,b)
+        local fs = rlFrame:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
+        fs:SetPoint("TOPLEFT",rlFrame,"TOPLEFT",10,yOff)
+        fs:SetTextColor(r or 1,g or 1,b or 1)
+        fs:SetText(text)
+        yOff = yOff-16
+        table.insert(rlFrame.content,fs)
+    end
 
-        local lbl = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        lbl:SetPoint("LEFT", cb, "RIGHT", 2, 0)
-        local r, g, b = GetClassColor(cls)
-        lbl:SetTextColor(r, g, b)
-        lbl:SetText(CLASS_DISPLAY[cls])
+    for _,h in ipairs(tmpl.healers) do
+        if deadSet[h.name] then
+            AddRLRow(h.name.."  [DEAD]",1,0.2,0.2)
+        else
+            AddRLRow(h.name.."  [alive]",0.2,1,0.2)
+        end
+        for _,t in ipairs(h.targets) do
+            AddRLRow("    "..GetTargetDisplayText(t),0.75,0.75,0.75)
+        end
+    end
 
-        cb:SetChecked(HealAssignDB.options.tankClasses[cls] or false)
-        local capturedCls = cls
-        cb:SetScript("OnClick", function()
-            HealAssignDB.options.tankClasses[capturedCls] = this:GetChecked()
+    local totalH = math.abs(yOff) + rowStep
+    if totalH < titleH + rowStep * 2 then totalH = titleH + rowStep * 2 end
+    rlFrame:SetHeight(totalH)
+    rlFrame:Show()
+end
+
+local function CreateRLFrame()
+    if not rlFrame then
+        rlFrame = CreateFrame("Frame","HealAssignRLFrame",UIParent)
+        rlFrame:SetWidth(240)
+        rlFrame:SetHeight(200)
+        rlFrame:SetPoint("TOPRIGHT",UIParent,"TOPRIGHT",-220,-200)
+        rlFrame:SetMovable(true)
+        rlFrame:EnableMouse(true)
+        rlFrame:RegisterForDrag("LeftButton")
+        rlFrame:SetScript("OnDragStart",function() this:StartMoving() end)
+        rlFrame:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
+        rlFrame:SetFrameStrata("MEDIUM")
+        rlFrame:SetBackdrop({
+            bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+            tile=true,tileSize=8,edgeSize=12,
+            insets={left=4,right=4,top=4,bottom=4}
+        })
+        rlFrame:SetBackdropColor(0.03,0.07,0.03,0.93)
+        rlFrame:SetBackdropBorderColor(0.2,0.8,0.2,0.8)
+        rlFrame.content = {}
+
+        local title = rlFrame:CreateFontString(nil,"OVERLAY","GameFontNormal")
+        title:SetPoint("TOP",rlFrame,"TOP",0,-10)
+        title:SetTextColor(0.2,1,0.2)
+        title:SetText("Heal Assignments")
+
+        local closeBtn = CreateFrame("Button",nil,rlFrame,"UIPanelCloseButton")
+        closeBtn:SetPoint("TOPRIGHT",rlFrame,"TOPRIGHT",-2,-2)
+        closeBtn:SetScript("OnClick",function() rlFrame:Hide() end)
+    end
+    UpdateRLFrame()
+end
+
+-------------------------------------------------------------------------------
+-- MAIN FRAME: HEALER GRID
+-------------------------------------------------------------------------------
+local mainCells = {}
+
+local function GetGridCols(count)
+    if count <= 2 then return 2
+    elseif count <= 6 then return 3
+    else return 4 end
+end
+
+local function RebuildMainGrid()
+    if not mainFrame then return end
+
+    for _,c in ipairs(mainCells) do c:Hide() end
+    mainCells = {}
+
+    local tmpl    = GetActiveTemplate()
+    local healers = (tmpl and tmpl.healers) or {}
+    local count   = table.getn(healers)
+
+    if mainFrame.noHealerText then mainFrame.noHealerText:Hide() end
+
+    if count == 0 then
+        if not mainFrame.noHealerText then
+            local fs = mainFrame:CreateFontString(nil,"OVERLAY","GameFontNormal")
+            fs:SetPoint("CENTER",mainFrame,"CENTER",0,-10)
+            fs:SetTextColor(0.5,0.5,0.5)
+            fs:SetText("No healers tagged.\nClick 'Raid Roster' and tag healers with [H].")
+            mainFrame.noHealerText = fs
+        end
+        mainFrame.noHealerText:Show()
+        mainFrame:SetHeight(160)
+        return
+    end
+
+    local cols  = GetGridCols(count)
+    local rows  = math.ceil(count/cols)
+    local cellW = 200
+    local padX  = 6
+    mainFrame:SetWidth(cols * (cellW + padX) + 20)
+    local padY  = 6
+    local topY  = -76
+    local targetRowH = 18  -- height per target row
+    local cellBaseH  = 58  -- name + divider + buttons + padding
+
+    -- Calculate height for each cell based on target count
+    local cellHeights = {}
+    for i,healer in ipairs(healers) do
+        local targetCount = table.getn(healer.targets or {})
+        local h = cellBaseH + targetCount * targetRowH
+        if h < 90 then h = 90 end
+        cellHeights[i] = h
+    end
+
+    -- Each row uses the max height of cells in that row
+    local rowHeights = {}
+    for r=0,rows-1 do
+        local maxH = 90
+        for c=0,cols-1 do
+            local idx = r*cols + c + 1
+            if cellHeights[idx] and cellHeights[idx] > maxH then
+                maxH = cellHeights[idx]
+            end
+        end
+        rowHeights[r] = maxH
+    end
+
+    -- Calculate Y offsets per row
+    local rowYOffsets = {}
+    local curY = topY
+    for r=0,rows-1 do
+        rowYOffsets[r] = curY
+        curY = curY - rowHeights[r] - padY
+    end
+
+    for i,healer in ipairs(healers) do
+        local col = math.mod(i-1, cols)
+        local row = math.floor((i-1) / cols)
+        local cellH = rowHeights[row]
+
+        local cell = CreateFrame("Frame",nil,mainFrame)
+        cell:SetWidth(cellW)
+        cell:SetHeight(cellH)
+        cell:SetPoint("TOPLEFT",mainFrame,"TOPLEFT",
+            10 + col*(cellW+padX),
+            rowYOffsets[row])
+        cell:SetBackdrop({
+            bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile=true,tileSize=8,edgeSize=8,
+            insets={left=3,right=3,top=3,bottom=3}
+        })
+        cell:SetBackdropColor(0.07,0.07,0.14,0.97)
+        cell:SetBackdropBorderColor(0.25,0.35,0.6,0.8)
+        table.insert(mainCells,cell)
+
+        -- Healer name
+        local hclass = (tmpl.roster[healer.name] and tmpl.roster[healer.name].class) or nil
+        local hr,hg,hb = GetClassColor(hclass)
+        local nameLabel = cell:CreateFontString(nil,"OVERLAY","GameFontNormal")
+        nameLabel:SetPoint("TOP",cell,"TOP",0,-7)
+        nameLabel:SetTextColor(hr,hg,hb)
+        nameLabel:SetText(healer.name)
+
+        local div = cell:CreateTexture(nil,"ARTWORK")
+        div:SetHeight(1)
+        div:SetPoint("TOPLEFT",cell,"TOPLEFT",5,-22)
+        div:SetPoint("TOPRIGHT",cell,"TOPRIGHT",-5,-22)
+        div:SetTexture(hr,hg,hb,0.35)
+
+        -- Target rows area
+        local targetArea = CreateFrame("Frame",nil,cell)
+        targetArea:SetPoint("TOPLEFT",cell,"TOPLEFT",4,-26)
+        targetArea:SetPoint("TOPRIGHT",cell,"TOPRIGHT",-4,-26)
+        targetArea:SetHeight(cellH - 60)
+        cell.targetArea  = targetArea
+        cell.targetRows  = {}
+
+        local capturedIdx = i
+
+        local function RebuildTargetRows()
+            for _,r in ipairs(cell.targetRows) do r:Hide() end
+            cell.targetRows = {}
+
+            local h = tmpl.healers[capturedIdx]
+            if not h then return end
+
+            local ty = 0
+            for tidx,target in ipairs(h.targets) do
+                local tcR,tcG,tcB = 0.88,0.88,0.88
+                if target.type == TYPE_TANK then
+                    if tmpl.roster and tmpl.roster[target.value] then
+                        tcR,tcG,tcB = GetClassColor(tmpl.roster[target.value].class)
+                    end
+                elseif target.type == TYPE_GROUP  then tcR,tcG,tcB = 0.5,0.85,1.0
+                elseif target.type == TYPE_CUSTOM then tcR,tcG,tcB = 0.9,0.6,1.0
+                end
+
+                -- Row frame: full width minus room for delete button
+                local trow = CreateFrame("Frame",nil,targetArea)
+                trow:SetHeight(17)
+                trow:SetPoint("TOPLEFT",targetArea,"TOPLEFT",0,ty)
+                trow:SetPoint("TOPRIGHT",targetArea,"TOPRIGHT",-20,ty)
+                table.insert(cell.targetRows,trow)
+
+                local tLabel = trow:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
+                tLabel:SetPoint("LEFT",trow,"LEFT",4,0)
+                tLabel:SetPoint("RIGHT",trow,"RIGHT",0,0)
+                tLabel:SetJustifyH("LEFT")
+                tLabel:SetTextColor(tcR,tcG,tcB)
+                tLabel:SetText(GetTargetDisplayText(target))
+
+                -- Delete button anchored to RIGHT of targetArea, same y as trow
+                local capturedTidx = tidx
+                local xBtn = CreateFrame("Button",nil,cell,"UIPanelButtonTemplate")
+                xBtn:SetWidth(16)
+                xBtn:SetHeight(16)
+                xBtn:SetPoint("TOPRIGHT",cell,"TOPRIGHT",-3,-25-(tidx-1)*18)
+                xBtn:SetText("x")
+                xBtn:SetScript("OnClick",function()
+                    table.remove(tmpl.healers[capturedIdx].targets, capturedTidx)
+                    RebuildMainGrid()
+                    UpdateAssignFrame()
+                end)
+                table.insert(cell.targetRows,xBtn)
+
+                ty = ty - 18
+            end
+        end
+
+        cell.RebuildTargetRows = RebuildTargetRows
+        RebuildTargetRows()
+
+        -- 4 add-target buttons at bottom
+        local btnH   = 18
+        local btnY   = 6   -- from bottom
+        local bW     = math.floor((cellW - 12) / 3)
+
+        local capturedCell = cell
+
+        local function MakeAddBtn(label, xOffset, onClick)
+            local btn = CreateFrame("Button",nil,cell,"UIPanelButtonTemplate")
+            btn:SetWidth(bW)
+            btn:SetHeight(btnH)
+            btn:SetPoint("BOTTOMLEFT",cell,"BOTTOMLEFT",6+xOffset,btnY)
+            btn:SetText(label)
+            btn:SetScript("OnClick",onClick)
+            return btn
+        end
+
+        -- Tank
+        MakeAddBtn("Tank", 0, function()
+            local items = {}
+            if tmpl and tmpl.roster then
+                local tNames = {}
+                for pname,pdata in pairs(tmpl.roster) do
+                    if pdata.tagT then table.insert(tNames,pname) end
+                end
+                table.sort(tNames)
+                for _,pname in ipairs(tNames) do
+                    local pdata = tmpl.roster[pname]
+                    local r2,g2,b2 = GetClassColor(pdata.class)
+                    table.insert(items,{text=pname,r=r2,g=g2,b=b2,targetType=TYPE_TANK,targetValue=pname})
+                end
+            end
+            if table.getn(items)==0 then
+                table.insert(items,{text="(No tanks tagged)",r=0.5,g=0.5,b=0.5})
+            end
+            local anchor = this
+            ShowDropdown(anchor, items, function(item)
+                if item.targetType then
+                    table.insert(tmpl.healers[capturedIdx].targets,{type=item.targetType,value=item.targetValue})
+                    RebuildMainGrid()
+                    UpdateAssignFrame()
+                end
+            end, 160)
+        end)
+
+        -- Group
+        MakeAddBtn("Group", bW+2, function()
+            local items = {}
+            for g=1,8 do table.insert(items,{text="Group "..g,targetType=TYPE_GROUP,targetValue=tostring(g)}) end
+            local anchor = this
+            ShowDropdown(anchor, items, function(item)
+                if item.targetType then
+                    table.insert(tmpl.healers[capturedIdx].targets,{type=item.targetType,value=item.targetValue})
+                    RebuildMainGrid()
+                    UpdateAssignFrame()
+                end
+            end, 100)
+        end)
+
+        -- Custom
+        MakeAddBtn("Custom", (bW+2)*2, function()
+            local items = {}
+            if HealAssignDB and HealAssignDB.options and HealAssignDB.options.customTargets then
+                for _,ct in ipairs(HealAssignDB.options.customTargets) do
+                    table.insert(items,{text=ct,targetType=TYPE_CUSTOM,targetValue=ct})
+                end
+            end
+            if table.getn(items)==0 then
+                table.insert(items,{text="(No custom targets)",r=0.5,g=0.5,b=0.5})
+            end
+            local anchor = this
+            ShowDropdown(anchor, items, function(item)
+                if item.targetType then
+                    table.insert(tmpl.healers[capturedIdx].targets,{type=item.targetType,value=item.targetValue})
+                    RebuildMainGrid()
+                    UpdateAssignFrame()
+                end
+            end, 160)
         end)
     end
 
-    -- Section: Death Notification Channel
-    local sec2 = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    sec2:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -182)
-    sec2:SetTextColor(1, 0.8, 0.2)
-    sec2:SetText("Death Notification Channel:")
+    -- Resize main frame height to fit grid
+    -- Total height = sum of all row heights + padding
+    local neededH = math.abs(topY) + 20
+    for r=0,rows-1 do neededH = neededH + rowHeights[r] + padY end
+    if neededH < 200 then neededH = 200 end
+    mainFrame:SetHeight(neededH)
+end
 
-    local chanEdit = CreateFrame("EditBox", "HealAssignChanEdit", f, "InputBoxTemplate")
-    chanEdit:SetWidth(150)
-    chanEdit:SetHeight(20)
-    chanEdit:SetPoint("LEFT", sec2, "RIGHT", 8, 0)
-    chanEdit:SetAutoFocus(false)
-    chanEdit:SetMaxLetters(32)
-    chanEdit:SetNumeric(false)
-    chanEdit:SetText(tostring(HealAssignDB.options.chatChannel or ""))
-    chanEdit:SetScript("OnEnterPressed", function()
-        this:ClearFocus()
-        local val = this:GetText()
-        if val and val ~= "" then HealAssignDB.options.chatChannel = val end
+-------------------------------------------------------------------------------
+-- RAID ROSTER FRAME
+-------------------------------------------------------------------------------
+local rosterRowWidgets = {}
+
+local function RebuildRosterRows()
+    if not rosterFrame then return end
+
+    for _,r in ipairs(rosterRowWidgets) do r:Hide() end
+    rosterRowWidgets = {}
+
+    local tmpl = GetActiveTemplate()
+    if not tmpl then return end
+
+    local members = GetRaidMembers()
+    -- Sync new members into roster
+    for _,m in ipairs(members) do
+        if not tmpl.roster[m.name] then
+            tmpl.roster[m.name] = {class=m.class, tag=nil, subgroup=m.subgroup or 1}
+        else
+            tmpl.roster[m.name].class    = m.class
+            tmpl.roster[m.name].subgroup = m.subgroup or tmpl.roster[m.name].subgroup or 1
+        end
+    end
+
+    -- Build groups 1-8
+    local groups = {}
+    for g=1,8 do groups[g] = {} end
+    for pname,pdata in pairs(tmpl.roster) do
+        local sg = pdata.subgroup or 1
+        if sg < 1 then sg = 1 end
+        if sg > 8 then sg = 8 end
+        table.insert(groups[sg], {name=pname, class=pdata.class, tagT=pdata.tagT, tagH=pdata.tagH, tagV=pdata.tagV, subgroup=sg})
+    end
+    for g=1,8 do
+        table.sort(groups[g], function(a,b) return a.name < b.name end)
+    end
+
+    local sc      = rosterFrame.scrollChild
+    -- Grid: 2 groups per row, 4 rows = 8 groups
+    local cols      = 2
+    local groupW    = 170  -- 70px name + 3x22px buttons + padding
+    local groupPadX = 10
+    local rowH      = 0    -- calculated per group
+    local playerH   = 16   -- height per player row
+    local headerH   = 18   -- group header height
+    local groupPadY = 12
+
+    -- Calculate max players per group for layout
+    local maxPerGroup = 0
+    for g=1,8 do
+        if table.getn(groups[g]) > maxPerGroup then
+            maxPerGroup = table.getn(groups[g])
+        end
+    end
+    local groupH = headerH + maxPerGroup * playerH + 8
+
+    local totalH = 0
+    local rows = math.ceil(8 / cols)
+
+    for gIdx=1,8 do
+        local col  = math.mod(gIdx-1, cols)
+        local grow = math.floor((gIdx-1) / cols)
+        local gx   = 6 + col * (groupW + groupPadX)
+        local gy   = -(6 + grow * (groupH + groupPadY))
+
+        -- Group container
+        local gFrame = CreateFrame("Frame",nil,sc)
+        gFrame:SetWidth(groupW)
+        gFrame:SetHeight(groupH)
+        gFrame:SetPoint("TOPLEFT",sc,"TOPLEFT",gx,gy)
+        gFrame:SetBackdrop({
+            bgFile   = "Interface\DialogFrame\UI-DialogBox-Background",
+            edgeFile = "Interface\Tooltips\UI-Tooltip-Border",
+            tile=true,tileSize=8,edgeSize=8,
+            insets={left=3,right=3,top=3,bottom=3}
+        })
+        gFrame:SetBackdropColor(0.07,0.07,0.14,0.95)
+        gFrame:SetBackdropBorderColor(0.25,0.35,0.6,0.7)
+        table.insert(rosterRowWidgets,gFrame)
+
+        -- Group header
+        local gLabel = gFrame:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
+        gLabel:SetPoint("TOPLEFT",gFrame,"TOPLEFT",5,-4)
+        gLabel:SetTextColor(0.7,0.7,0.7)
+        gLabel:SetText("Group "..gIdx)
+
+        -- Players
+        local py = -headerH
+        for _,p in ipairs(groups[gIdx]) do
+            local pRow = CreateFrame("Frame",nil,gFrame)
+            pRow:SetHeight(playerH)
+            pRow:SetPoint("TOPLEFT",gFrame,"TOPLEFT",4,py)
+            pRow:SetPoint("TOPRIGHT",gFrame,"TOPRIGHT",-4,py)
+            table.insert(rosterRowWidgets,pRow)
+
+            local r,g2,b = GetClassColor(p.class)
+
+            local capturedName = p.name
+
+            -- T button first (right-anchored)
+            local tBtn = CreateFrame("Button",nil,pRow,"UIPanelButtonTemplate")
+            tBtn:SetWidth(22)
+            tBtn:SetHeight(14)
+            tBtn:SetText("T")
+            if p.tagT then tBtn:SetTextColor(1,0.85,0)
+            else tBtn:SetTextColor(0.35,0.35,0.35) end
+
+            local hBtn = CreateFrame("Button",nil,pRow,"UIPanelButtonTemplate")
+            hBtn:SetWidth(22)
+            hBtn:SetHeight(14)
+            hBtn:SetText("H")
+            if p.tagH then hBtn:SetTextColor(0.3,1,0.3)
+            else hBtn:SetTextColor(0.35,0.35,0.35) end
+
+            local vBtn = CreateFrame("Button",nil,pRow,"UIPanelButtonTemplate")
+            vBtn:SetWidth(22)
+            vBtn:SetHeight(14)
+            vBtn:SetText("V")
+            if p.tagV then vBtn:SetTextColor(0.4,0.9,1)
+            else vBtn:SetTextColor(0.35,0.35,0.35) end
+
+            local nameLabel = pRow:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
+            nameLabel:SetPoint("LEFT",pRow,"LEFT",4,0)
+            nameLabel:SetWidth(72)
+            nameLabel:SetJustifyH("LEFT")
+            nameLabel:SetTextColor(r,g2,b)
+            nameLabel:SetText(p.name)
+
+            tBtn:SetPoint("LEFT",pRow,"LEFT",78,0)
+            hBtn:SetPoint("LEFT",tBtn,"RIGHT",2,0)
+            vBtn:SetPoint("LEFT",hBtn,"RIGHT",2,0)
+
+            tBtn:SetScript("OnClick",function()
+                local entry = tmpl.roster[capturedName]
+                if entry then
+                    entry.tagT = not entry.tagT
+                    if entry.tagT then entry.tagH = false end  -- T excludes H
+                    SyncHealersFromRoster(tmpl)
+                    RebuildRosterRows()
+                    RebuildMainGrid()
+                    UpdateAssignFrame()
+                end
+            end)
+
+            hBtn:SetScript("OnClick",function()
+                local entry = tmpl.roster[capturedName]
+                if entry then
+                    entry.tagH = not entry.tagH
+                    if entry.tagH then entry.tagT = false end  -- H excludes T
+                    SyncHealersFromRoster(tmpl)
+                    RebuildRosterRows()
+                    RebuildMainGrid()
+                    UpdateAssignFrame()
+                end
+            end)
+
+            local capturedVName = p.name
+            vBtn:SetScript("OnClick",function()
+                local entry = tmpl.roster[capturedVName]
+                if entry then
+                    entry.tagV = not entry.tagV
+                    RebuildRosterRows()
+                    UpdateAssignFrame()
+                end
+            end)
+
+            py = py - playerH
+        end
+
+        -- Track total height
+        local thisRowBottom = 6 + grow*(groupH+groupPadY) + groupH
+        if thisRowBottom > totalH then totalH = thisRowBottom end
+    end
+
+    sc:SetHeight(totalH + 20)
+end
+
+local function CreateRosterFrame()
+    if rosterFrame then
+        RebuildRosterRows()
+        rosterFrame:Raise()
+        rosterFrame:Show()
+        PushWindow(rosterFrame)
+        return
+    end
+
+    rosterFrame = CreateFrame("Frame","HealAssignRosterFrame",UIParent)
+    rosterFrame:SetWidth(360)
+    rosterFrame:SetHeight(520)
+    rosterFrame:SetPoint("TOPLEFT",mainFrame,"TOPRIGHT",10,0)
+    rosterFrame:SetMovable(true)
+    rosterFrame:EnableMouse(true)
+    rosterFrame:RegisterForDrag("LeftButton")
+    rosterFrame:SetScript("OnDragStart",function() this:StartMoving() end)
+    rosterFrame:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
+    rosterFrame:SetFrameStrata("DIALOG")
+    rosterFrame:SetFrameLevel(10)
+    rosterFrame:SetBackdrop({
+        bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+        tile=true,tileSize=8,edgeSize=16,
+        insets={left=4,right=4,top=4,bottom=4}
+    })
+    local _alpha = (HealAssignDB and HealAssignDB.options and HealAssignDB.options.windowAlpha) or 0.95
+    rosterFrame:SetBackdropColor(0.04,0.04,0.1,_alpha)
+
+    local title = rosterFrame:CreateFontString(nil,"OVERLAY","GameFontNormalLarge")
+    title:SetPoint("TOP",rosterFrame,"TOP",0,-12)
+    title:SetTextColor(0.4,0.8,1)
+    title:SetText("Raid Roster")
+
+    -- Headers
+    -- No column headers needed - groups have their own labels
+
+    local closeBtn = CreateFrame("Button",nil,rosterFrame,"UIPanelCloseButton")
+    closeBtn:SetPoint("TOPRIGHT",rosterFrame,"TOPRIGHT",-4,-4)
+    closeBtn:SetScript("OnClick",function() rosterFrame:Hide() end)
+    HookFrameHide(rosterFrame)
+
+    local resetRosterBtn = CreateFrame("Button",nil,rosterFrame,"UIPanelButtonTemplate")
+    resetRosterBtn:SetWidth(70)
+    resetRosterBtn:SetHeight(20)
+    resetRosterBtn:SetPoint("BOTTOMLEFT",rosterFrame,"BOTTOMLEFT",10,10)
+    resetRosterBtn:SetText("Reset Tags")
+    resetRosterBtn:SetScript("OnClick",function()
+        local tmpl = GetActiveTemplate()
+        if tmpl and tmpl.roster then
+            for _,pdata in pairs(tmpl.roster) do
+                pdata.tagT = nil
+                pdata.tagH = nil
+                pdata.tagV = nil
+            end
+            SyncHealersFromRoster(tmpl)
+            RebuildRosterRows()
+            RebuildMainGrid()
+            UpdateAssignFrame()
+        end
     end)
-    chanEdit:SetScript("OnEditFocusLost", function()
-        local val = this:GetText()
-        if val and val ~= "" then HealAssignDB.options.chatChannel = val end
+
+    local sf = CreateFrame("ScrollFrame","HealAssignRosterScroll",rosterFrame)
+    sf:SetPoint("TOPLEFT",    rosterFrame,"TOPLEFT",   8,-42)
+    sf:SetPoint("BOTTOMRIGHT",rosterFrame,"BOTTOMRIGHT",-14,36)
+    rosterFrame.scrollFrame = sf
+
+    local sc = CreateFrame("Frame","HealAssignRosterScrollChild",sf)
+    sc:SetWidth(336)
+    sc:SetHeight(800)
+    sf:SetScrollChild(sc)
+    rosterFrame.scrollChild = sc
+
+    sf:EnableMouseWheel(true)
+    sf:SetScript("OnMouseWheel",function()
+        local cur = sf:GetVerticalScroll()
+        local max = sf:GetVerticalScrollRange()
+        local delta = arg1 * -20
+        local new = cur + delta
+        if new < 0 then new = 0 end
+        if new > max then new = max end
+        sf:SetVerticalScroll(new)
     end)
 
-    local chanNote = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    chanNote:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -205)
-    chanNote:SetTextColor(0.55, 0.55, 0.55)
-    chanNote:SetText("Set to 0 to disable. Posts: 'PlayerName (tank/healer) dead'")
+    RebuildRosterRows()
+    rosterFrame:Raise()
+    rosterFrame:Show()
+    PushWindow(rosterFrame)
+end
 
-    -- Section: Font Size
-    local secFont = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    secFont:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -230) -- Adjusted position
-    secFont:SetTextColor(1, 0.8, 0.2)
+-------------------------------------------------------------------------------
+-- OPTIONS FRAME
+-------------------------------------------------------------------------------
+function CreateOptionsFrame()
+    if optionsFrame then optionsFrame:Raise() optionsFrame:Show() PushWindow(optionsFrame) return end
+
+    optionsFrame = CreateFrame("Frame","HealAssignOptionsFrame",UIParent)
+    optionsFrame:SetWidth(360)
+    optionsFrame:SetHeight(480)
+    optionsFrame:SetPoint("CENTER",UIParent,"CENTER")
+    optionsFrame:SetMovable(true)
+    optionsFrame:EnableMouse(true)
+    optionsFrame:RegisterForDrag("LeftButton")
+    optionsFrame:SetScript("OnDragStart",function() this:StartMoving() end)
+    optionsFrame:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
+    optionsFrame:SetFrameStrata("DIALOG")
+    optionsFrame:SetFrameLevel(20)
+    optionsFrame:SetBackdrop({
+        bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+        tile=true,tileSize=8,edgeSize=16,
+        insets={left=4,right=4,top=4,bottom=4}
+    })
+    local _alpha = (HealAssignDB and HealAssignDB.options and HealAssignDB.options.windowAlpha) or 0.95
+    optionsFrame:SetBackdropColor(0.04,0.04,0.1,_alpha)
+
+    local title = optionsFrame:CreateFontString(nil,"OVERLAY","GameFontNormalLarge")
+    title:SetPoint("TOP",optionsFrame,"TOP",0,-12)
+    title:SetTextColor(0.4,0.8,1)
+    title:SetText("HealAssign Options")
+
+    local closeBtn = CreateFrame("Button",nil,optionsFrame,"UIPanelCloseButton")
+    closeBtn:SetPoint("TOPRIGHT",optionsFrame,"TOPRIGHT",-4,-4)
+    closeBtn:SetScript("OnClick",function() optionsFrame:Hide() end)
+    HookFrameHide(optionsFrame)
+
+    local y = -44
+
+    -- Font size
+    local secFont = optionsFrame:CreateFontString(nil,"OVERLAY","GameFontNormal")
+    secFont:SetPoint("TOPLEFT",optionsFrame,"TOPLEFT",14,y)
+    secFont:SetTextColor(1,0.8,0.2)
     secFont:SetText("Assignments Font Size:")
+    y = y-30
 
-    local fontSlider = CreateFrame("Slider", "HealAssignFontSlider", f, "OptionsSliderTemplate")
-    fontSlider:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -260) -- Added more space below title
+    local fontSlider = CreateFrame("Slider","HealAssignFontSlider",optionsFrame,"OptionsSliderTemplate")
+    fontSlider:SetPoint("TOPLEFT",optionsFrame,"TOPLEFT",16,y)
     fontSlider:SetWidth(200)
-    fontSlider:SetHeight(16)
-    fontSlider:SetMinMaxValues(8, 24)
+    fontSlider:SetMinMaxValues(8,24)
     fontSlider:SetValueStep(1)
     fontSlider:SetValue(HealAssignDB.options.fontSize or 12)
-
-    getglobal(fontSlider:GetName().."Text"):SetText("Size: " .. (HealAssignDB.options.fontSize or 12))
+    getglobal(fontSlider:GetName().."Text"):SetText("Size: "..(HealAssignDB.options.fontSize or 12))
     getglobal(fontSlider:GetName().."Low"):SetText("8")
     getglobal(fontSlider:GetName().."High"):SetText("24")
-
-    fontSlider:SetScript("OnValueChanged", function()
+    fontSlider:SetScript("OnValueChanged",function()
         local val = math.floor(this:GetValue())
         HealAssignDB.options.fontSize = val
-        getglobal(this:GetName().."Text"):SetText("Size: " .. val)
-        -- Trigger immediate update of the assignments display
-        if UpdateAssignFrame then UpdateAssignFrame() end
+        getglobal(this:GetName().."Text"):SetText("Size: "..val)
+        UpdateAssignFrame()
     end)
+    y = y-44
 
-    -- Section: Custom Targets
-    local sec3 = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    sec3:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -300) -- Shifted down
-    sec3:SetTextColor(1, 0.8, 0.2)
+    -- Window opacity
+    local secAlpha = optionsFrame:CreateFontString(nil,"OVERLAY","GameFontNormal")
+    secAlpha:SetPoint("TOPLEFT",optionsFrame,"TOPLEFT",14,y)
+    secAlpha:SetTextColor(1,0.8,0.2)
+    secAlpha:SetText("Window Opacity:")
+    y = y-30
+
+    local alphaSlider = CreateFrame("Slider","HealAssignAlphaSlider",optionsFrame,"OptionsSliderTemplate")
+    alphaSlider:SetPoint("TOPLEFT",optionsFrame,"TOPLEFT",16,y)
+    alphaSlider:SetWidth(200)
+    alphaSlider:SetMinMaxValues(0.3,1.0)
+    alphaSlider:SetValueStep(0.05)
+    local curAlpha = (HealAssignDB.options and HealAssignDB.options.windowAlpha) or 0.95
+    alphaSlider:SetValue(curAlpha)
+    getglobal(alphaSlider:GetName().."Text"):SetText(math.floor(curAlpha*100).."%")
+    getglobal(alphaSlider:GetName().."Low"):SetText("30%")
+    getglobal(alphaSlider:GetName().."High"):SetText("100%")
+    alphaSlider:SetScript("OnValueChanged",function()
+        local val = this:GetValue()
+        -- round to 0.05
+        val = math.floor(val * 20 + 0.5) / 20
+        HealAssignDB.options.windowAlpha = val
+        getglobal(this:GetName().."Text"):SetText(math.floor(val*100).."%")
+        ApplyWindowAlpha(val)
+    end)
+    y = y-44
+
+    -- Show assign frame
+    local showCB = CreateFrame("CheckButton","HealAssignShowCB",optionsFrame,"UICheckButtonTemplate")
+    showCB:SetWidth(20)
+    showCB:SetHeight(20)
+    showCB:SetPoint("TOPLEFT",optionsFrame,"TOPLEFT",14,y)
+    showCB:SetChecked(HealAssignDB.options.showAssignFrame)
+    showCB:SetScript("OnClick",function()
+        HealAssignDB.options.showAssignFrame = this:GetChecked()
+        if assignFrame then
+            local inRaid = GetNumRaidMembers() > 0
+            if inRaid or HealAssignDB.options.showAssignFrame then
+                UpdateAssignFrame()
+            else
+                assignFrame:Hide()
+            end
+        end
+    end)
+    local showLbl = optionsFrame:CreateFontString(nil,"OVERLAY","GameFontNormal")
+    showLbl:SetPoint("LEFT",showCB,"RIGHT",4,0)
+    showLbl:SetText("Show Assignments outside raid")
+    y = y-36
+
+    -- Custom targets
+    local sec3 = optionsFrame:CreateFontString(nil,"OVERLAY","GameFontNormal")
+    sec3:SetPoint("TOPLEFT",optionsFrame,"TOPLEFT",14,y)
+    sec3:SetTextColor(1,0.8,0.2)
     sec3:SetText("Custom Assignment Targets:")
+    y = y-18
 
-    local customNote = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    customNote:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -317)
-    customNote:SetTextColor(0.55, 0.55, 0.55)
-    customNote:SetText("e.g. 'Main Tank', 'OT Mark', 'Skull Target'")
+    local customNote = optionsFrame:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
+    customNote:SetPoint("TOPLEFT",optionsFrame,"TOPLEFT",14,y)
+    customNote:SetTextColor(0.55,0.55,0.55)
+    customNote:SetText("e.g. 'Main Tank', 'OT', 'Skull Target'")
+    y = y-22
 
-    local customEdit = CreateFrame("EditBox", "HealAssignCustomEdit", f, "InputBoxTemplate")
+    local customEdit = CreateFrame("EditBox","HealAssignCustomEdit",optionsFrame,"InputBoxTemplate")
     customEdit:SetWidth(210)
     customEdit:SetHeight(20)
-    customEdit:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -335)
+    customEdit:SetPoint("TOPLEFT",optionsFrame,"TOPLEFT",14,y)
     customEdit:SetAutoFocus(false)
     customEdit:SetMaxLetters(64)
     customEdit:SetText("")
 
-    local addCustomBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    addCustomBtn:SetWidth(60)
-    addCustomBtn:SetHeight(20)
-    addCustomBtn:SetPoint("LEFT", customEdit, "RIGHT", 5, 0)
-    addCustomBtn:SetText("Add")
+    local addBtn = CreateFrame("Button",nil,optionsFrame,"UIPanelButtonTemplate")
+    addBtn:SetWidth(60)
+    addBtn:SetHeight(20)
+    addBtn:SetPoint("LEFT",customEdit,"RIGHT",5,0)
+    addBtn:SetText("Add")
+    y = y-28
 
-    -- Custom targets list
-    local customListFrame = CreateFrame("Frame", nil, f)
-    customListFrame:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -360)
-    customListFrame:SetWidth(330)
-    customListFrame:SetHeight(120)
-    customListFrame.rows = {}
-    f.customListFrame = customListFrame
+    local clf = CreateFrame("Frame",nil,optionsFrame)
+    clf:SetPoint("TOPLEFT",optionsFrame,"TOPLEFT",14,y)
+    clf:SetWidth(330)
+    clf:SetHeight(120)
+    clf.rows = {}
+    optionsFrame.clf = clf
 
     local function RefreshCustomList()
-        for _, r in ipairs(customListFrame.rows) do r:Hide() end
-        customListFrame.rows = {}
-        local targets = HealAssignDB.options.customTargets
-        for i = 1, table.getn(targets) do
-            local ct = targets[i]
-            local row = CreateFrame("Frame", nil, customListFrame)
+        for _,r in ipairs(clf.rows) do r:Hide() end
+        clf.rows = {}
+        for i,ct in ipairs(HealAssignDB.options.customTargets) do
+            local row = CreateFrame("Frame",nil,clf)
             row:SetHeight(18)
-            row:SetPoint("TOPLEFT", customListFrame, "TOPLEFT", 0, -(i-1)*18)
+            row:SetPoint("TOPLEFT",clf,"TOPLEFT",0,-(i-1)*18)
             row:SetWidth(330)
-            table.insert(customListFrame.rows, row)
+            table.insert(clf.rows,row)
 
-            local lbl = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-            lbl:SetPoint("LEFT", row, "LEFT", 2, 0)
-            lbl:SetTextColor(0.85, 0.85, 0.85)
+            local lbl = row:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
+            lbl:SetPoint("LEFT",row,"LEFT",2,0)
+            lbl:SetTextColor(0.85,0.85,0.85)
             lbl:SetText(ct)
 
-            local delBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+            local delBtn = CreateFrame("Button",nil,row,"UIPanelButtonTemplate")
             delBtn:SetWidth(22)
             delBtn:SetHeight(16)
-            delBtn:SetPoint("RIGHT", row, "RIGHT", -2, 0)
+            delBtn:SetPoint("RIGHT",row,"RIGHT",-2,0)
             delBtn:SetText("X")
-            
             local idx = i
-            delBtn:SetScript("OnClick", function()
-                table.remove(HealAssignDB.options.customTargets, idx)
+            delBtn:SetScript("OnClick",function()
+                table.remove(HealAssignDB.options.customTargets,idx)
                 RefreshCustomList()
             end)
         end
     end
-    f.RefreshCustomList = RefreshCustomList
 
-    addCustomBtn:SetScript("OnClick", function()
+    addBtn:SetScript("OnClick",function()
         local txt = customEdit:GetText()
         if txt and txt ~= "" then
-            table.insert(HealAssignDB.options.customTargets, txt)
+            table.insert(HealAssignDB.options.customTargets,txt)
             customEdit:SetText("")
             RefreshCustomList()
         end
     end)
 
-    -- Show Assign Frame toggle
-    local showAssignCB = CreateFrame("CheckButton", "HealAssignShowAssignCB", f, "UICheckButtonTemplate")
-    showAssignCB:SetWidth(20)
-    showAssignCB:SetHeight(20)
-    showAssignCB:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -520)
-    showAssignCB:SetChecked(HealAssignDB.options.showAssignFrame)
-    showAssignCB:SetScript("OnClick", function()
-        HealAssignDB.options.showAssignFrame = this:GetChecked()
-        if HealAssignDB.options.showAssignFrame then
-            if assignFrame then assignFrame:Show(); UpdateAssignFrame() end
+    RefreshCustomList()
+    optionsFrame:Raise()
+    optionsFrame:Show()
+    PushWindow(optionsFrame)
+end
+
+-------------------------------------------------------------------------------
+-- MAIN FRAME
+-------------------------------------------------------------------------------
+local function CreateMainFrame()
+    if mainFrame then
+        mainFrame:Show()
+        RebuildMainGrid()
+        return
+    end
+
+    mainFrame = CreateFrame("Frame","HealAssignMainFrame",UIParent)
+    mainFrame:SetWidth(560)
+    mainFrame:SetHeight(300)
+    mainFrame:SetPoint("CENTER",UIParent,"CENTER")
+    mainFrame:SetMovable(true)
+    mainFrame:EnableMouse(true)
+    mainFrame:RegisterForDrag("LeftButton")
+    mainFrame:SetScript("OnDragStart",function() this:StartMoving() end)
+    mainFrame:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
+    mainFrame:SetFrameStrata("HIGH")
+    mainFrame:SetBackdrop({
+        bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+        tile=true,tileSize=8,edgeSize=16,
+        insets={left=4,right=4,top=4,bottom=4}
+    })
+    local _alpha = (HealAssignDB and HealAssignDB.options and HealAssignDB.options.windowAlpha) or 0.95
+    mainFrame:SetBackdropColor(0.04,0.04,0.1,_alpha)
+    mainFrame:SetBackdropBorderColor(0.3,0.5,0.8,0.9)
+
+    local title = mainFrame:CreateFontString(nil,"OVERLAY","GameFontNormalLarge")
+    title:SetPoint("TOP",mainFrame,"TOP",0,-10)
+    title:SetTextColor(0.4,0.8,1)
+    title:SetText("HealAssign  v"..ADDON_VERSION)
+
+    local closeBtn = CreateFrame("Button",nil,mainFrame,"UIPanelCloseButton")
+    closeBtn:SetPoint("TOPRIGHT",mainFrame,"TOPRIGHT",-4,-4)
+    closeBtn:SetScript("OnClick",function()
+        mainFrame:Hide()
+        CloseDropdown()
+        if rosterFrame then rosterFrame:Hide() end
+    end)
+    HookFrameHide(mainFrame)
+
+    -- Template controls row
+    local nameLabel = mainFrame:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
+    nameLabel:SetPoint("TOPLEFT",mainFrame,"TOPLEFT",10,-34)
+    nameLabel:SetTextColor(0.6,0.6,0.6)
+    nameLabel:SetText("Template:")
+
+    local nameEdit = CreateFrame("EditBox","HealAssignNameEdit",mainFrame,"InputBoxTemplate")
+    nameEdit:SetWidth(100)
+    nameEdit:SetHeight(20)
+    nameEdit:SetPoint("LEFT",nameLabel,"RIGHT",4,0)
+    nameEdit:SetAutoFocus(false)
+    nameEdit:SetMaxLetters(48)
+    if currentTemplate then nameEdit:SetText(currentTemplate.name or "") end
+    mainFrame.nameEdit = nameEdit
+
+    local function MakeTopBtn(label, parent, onClick)
+        local btn = CreateFrame("Button",nil,mainFrame,"UIPanelButtonTemplate")
+        btn:SetWidth(46)
+        btn:SetHeight(20)
+        btn:SetPoint("LEFT",parent,"RIGHT",2,0)
+        btn:SetText(label)
+        btn:SetScript("OnClick",onClick)
+        return btn
+    end
+
+    local newBtn = MakeTopBtn("New", nameEdit, function()
+        if IsCurrentTemplateDirty() then
+            StaticPopup_Show("HEALASSIGN_SAVE_BEFORE_NEW")
         else
-            if assignFrame then assignFrame:Hide() end
+            _DoNewTemplate()
         end
     end)
-    local showAssignLbl = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    showAssignLbl:SetPoint("LEFT", showAssignCB, "RIGHT", 2, 0)
-    showAssignLbl:SetText("Show My Assignments Frame")
 
-    optionsFrame = f
-    RefreshCustomList()
-    f:Show()
+    local saveBtn = MakeTopBtn("Save", newBtn, function()
+        local name = nameEdit:GetText()
+        if not name or name == "" then
+            DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Enter a template name first.")
+            return
+        end
+        if not currentTemplate then currentTemplate = NewTemplate(name) end
+        currentTemplate.name = name
+        HealAssignDB.templates[name] = DeepCopy(currentTemplate)
+        HealAssignDB.activeTemplate  = name
+        DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Saved '"..name.."'.")
+    end)
+
+    local loadBtn = MakeTopBtn("Load", saveBtn, function()
+        local items = {}
+        for tname,_ in pairs(HealAssignDB.templates) do
+            table.insert(items,{text=tname,tname=tname})
+        end
+        table.sort(items,function(a,b) return a.text < b.text end)
+        if table.getn(items)==0 then table.insert(items,{text="(No saved templates)",r=0.5,g=0.5,b=0.5}) end
+        ShowDropdown(this, items, function(item)
+            if item.tname then
+                currentTemplate = DeepCopy(HealAssignDB.templates[item.tname])
+                HealAssignDB.activeTemplate = item.tname
+                nameEdit:SetText(currentTemplate.name)
+                RebuildMainGrid()
+                UpdateAssignFrame()
+            end
+        end, 180)
+    end)
+
+
+
+    local delBtn = CreateFrame("Button",nil,mainFrame,"UIPanelButtonTemplate")
+    delBtn:SetWidth(46)
+    delBtn:SetHeight(20)
+    delBtn:SetPoint("LEFT",loadBtn,"RIGHT",3,0)
+    delBtn:SetText("Delete")
+    delBtn:SetScript("OnClick",function()
+        local name = nameEdit:GetText()
+        if name and name ~= "" and HealAssignDB.templates[name] then
+            StaticPopup_Show("HEALASSIGN_CONFIRM_DELETE", name)
+        else
+            DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r No saved template with that name.")
+        end
+    end)
+
+    local resetBtn = CreateFrame("Button",nil,mainFrame,"UIPanelButtonTemplate")
+    resetBtn:SetWidth(46)
+    resetBtn:SetHeight(20)
+    resetBtn:SetPoint("LEFT",delBtn,"RIGHT",3,0)
+    resetBtn:SetText("Reset")
+    resetBtn:SetScript("OnClick",function()
+        local tmpl = GetActiveTemplate()
+        if tmpl then
+            for _,h in ipairs(tmpl.healers) do h.targets = {} end
+            RebuildMainGrid()
+            UpdateAssignFrame()
+        end
+    end)
+
+    -- Store nameEdit ref for StaticPopup callbacks
+    _nameEditRef = nameEdit
+    InitStaticPopups()
+
+    -- Tooltips row 1
+    AddTooltip(newBtn,    "Create a new empty template. Prompts to save if unsaved changes exist.")
+    AddTooltip(saveBtn,   "Save current template to database.")
+    AddTooltip(loadBtn,   "Load a saved template. Click again to close.")
+    AddTooltip(delBtn,    "Permanently delete the current saved template.")
+    AddTooltip(resetBtn,  "Clear all healer assignments but keep the template.")
+
+    -- Row 2
+    local rosterBtn = CreateFrame("Button",nil,mainFrame,"UIPanelButtonTemplate")
+    rosterBtn:SetWidth(88)
+    rosterBtn:SetHeight(20)
+    rosterBtn:SetPoint("TOPLEFT",newBtn,"BOTTOMLEFT",0,-4)
+    rosterBtn:SetText("Raid Roster")
+    rosterBtn:SetScript("OnClick",function()
+        if rosterFrame and rosterFrame:IsShown() then rosterFrame:Hide()
+        else CreateRosterFrame() end
+    end)
+
+    local syncBtn = MakeTopBtn("Sync", rosterBtn, function() HealAssign_SyncTemplate() end)
+
+    local optBtn = CreateFrame("Button",nil,mainFrame,"UIPanelButtonTemplate")
+    optBtn:SetWidth(64)
+    optBtn:SetHeight(20)
+    optBtn:SetPoint("LEFT",syncBtn,"RIGHT",3,0)
+    optBtn:SetText("Options")
+    optBtn:SetScript("OnClick",function()
+        if optionsFrame and optionsFrame:IsShown() then optionsFrame:Hide()
+        else CreateOptionsFrame() end
+    end)
+
+    -- Tooltips row 2
+    AddTooltip(rosterBtn, "Open Raid Roster to tag tanks, healers and viewers.")
+    AddTooltip(syncBtn,   "Broadcast current template to all raid members with the addon.")
+    AddTooltip(optBtn,    "Open addon options: font size, opacity, assign frame settings.")
+
+    RebuildMainGrid()
+    PushWindow(mainFrame)
 end
+
+-- Wire up forward references now that all functions are defined
+_RebuildMainGrid       = RebuildMainGrid
+_UpdateAssignFrame     = UpdateAssignFrame
+_SyncHealersFromRoster = SyncHealersFromRoster
+_RebuildRosterRows     = RebuildRosterRows
 
 -------------------------------------------------------------------------------
 -- SYNC / COMMUNICATION
 -------------------------------------------------------------------------------
 local incomingChunks = {}
+local CHUNK_SIZE = 200
 
 function HealAssign_SyncTemplate()
     local tmpl = GetActiveTemplate()
@@ -1400,86 +1902,85 @@ function HealAssign_SyncTemplate()
         DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r No active template to sync.")
         return
     end
-    
-    local data = Serialize(tmpl)
-    if not data then
-        DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Failed to serialize template.")
+
+    local numRaid  = GetNumRaidMembers()
+    local numParty = GetNumPartyMembers()
+    local channel
+    if numRaid and numRaid > 0 then channel = "RAID"
+    elseif numParty and numParty > 0 then channel = "PARTY"
+    else
+        DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Not in a group.")
         return
     end
 
-    -- Escape characters that cause "Invalid escape code" in WoW 1.12.1
-    data = string.gsub(data, "%%", "{perc}")
-    data = string.gsub(data, "\\", "{bs}")
-    data = string.gsub(data, "|", "{pipe}")
+    local data = Serialize(tmpl)
+    data = string.gsub(data,"%%","{perc}")
+    data = string.gsub(data,"\\","{bs}")
+    data = string.gsub(data,"|","{pipe}")
 
-    local channel = "RAID"
-    if GetNumRaidMembers() == 0 then
-        channel = "PARTY"
-        if GetNumPartyMembers() == 0 then
-            DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Not in a group.")
-            return
-        end
+    local chunks = {}
+    local len = string.len(data)
+    local i = 1
+    while i <= len do
+        table.insert(chunks, string.sub(data,i,i+CHUNK_SIZE-1))
+        i = i+CHUNK_SIZE
     end
+    if table.getn(chunks)==0 then table.insert(chunks,"") end
 
-    local CHUNK_SIZE = 150 
-    local totalLen = string.len(data)
-    local numChunks = math.ceil(totalLen / CHUNK_SIZE)
-    if numChunks < 1 then numChunks = 1 end
-
-    for i = 1, numChunks do
-        local startPos = (i-1) * CHUNK_SIZE + 1
-        local endPos = i * CHUNK_SIZE
-        local chunk = string.sub(data, startPos, endPos)
-        
-        -- Using semicolon separator to avoid chat parser confusion
-        local msg = "S;"..i..";"..numChunks..";"..chunk
-        SendAddonMessage(COMM_PREFIX, msg, channel)
+    local total = table.getn(chunks)
+    for ci,chunk in ipairs(chunks) do
+        if channel then pcall(SendAddonMessage, COMM_PREFIX,"S;"..ci..";"..total..";"..chunk, channel) end
     end
-
-    -- Update own frame immediately after syncing
-    UpdateAssignFrame()
-    
-    DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Template '"..tmpl.name.."' synced.")
+    DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Synced '"..tmpl.name.."' ("..total.." chunk(s)).")
 end
 
-local function HandleAddonMessage(prefix, msg, channel, sender)
+local function HandleAddonMessage(prefix,msg,channel,sender)
     if prefix ~= COMM_PREFIX then return end
-    if sender == UnitName("player") then return end
+    local myName = UnitName("player")
+    if sender == myName then return end
 
-    -- Parse S;index;total;data format
-    local _, _, cIdx, tChunks, d = string.find(msg, "^S;(%d+);(%d+);(.+)$")
+    -- Death signal
+    local _,_,deadName = string.find(msg,"^DEAD;(.+)$")
+    if deadName then
+        local tmpl = GetActiveTemplate()
+        if tmpl then
+            for _,h in ipairs(tmpl.healers) do
+                if h.name == deadName then
+                    TriggerHealerDeath(deadName, h.targets)
+                    UpdateAssignFrame()
+                    if rlFrame and rlFrame:IsShown() then UpdateRLFrame() end
+                    break
+                end
+            end
+        end
+        return
+    end
+
+    -- Chunk
+    local _,_,cIdx,tChunks,d = string.find(msg,"^S;(%d+);(%d+);(.*)$")
     if not cIdx then return end
-    
-    local chunkIdx = tonumber(cIdx)
+
+    local chunkIdx    = tonumber(cIdx)
     local totalChunks = tonumber(tChunks)
-    local data = d
 
     if not incomingChunks[sender] or incomingChunks[sender].total ~= totalChunks then
-        incomingChunks[sender] = {total = totalChunks, chunks = {}}
+        incomingChunks[sender] = {total=totalChunks, chunks={}}
     end
-    
-    incomingChunks[sender].chunks[chunkIdx] = data
+    incomingChunks[sender].chunks[chunkIdx] = d or ""
 
-    -- Check if all chunks received
     local allReceived = true
-    for i = 1, totalChunks do
-        if not incomingChunks[sender].chunks[i] then
-            allReceived = false
-            break
-        end
+    for i=1,totalChunks do
+        if not incomingChunks[sender].chunks[i] then allReceived=false break end
     end
 
     if allReceived then
         local fullData = ""
-        for i = 1, totalChunks do
-            fullData = fullData .. incomingChunks[sender].chunks[i]
-        end
+        for i=1,totalChunks do fullData = fullData..incomingChunks[sender].chunks[i] end
         incomingChunks[sender] = nil
 
-        -- Restore escaped characters
-        fullData = string.gsub(fullData, "{perc}", "%%")
-        fullData = string.gsub(fullData, "{bs}", "\\")
-        fullData = string.gsub(fullData, "{pipe}", "|")
+        fullData = string.gsub(fullData,"{perc}","%%")
+        fullData = string.gsub(fullData,"{bs}","\\")
+        fullData = string.gsub(fullData,"{pipe}","|")
 
         local tmpl = Deserialize(fullData)
         if tmpl then
@@ -1487,99 +1988,208 @@ local function HandleAddonMessage(prefix, msg, channel, sender)
             HealAssignDB.activeTemplate = tmpl.name
             currentTemplate = tmpl
             DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Received '"..tmpl.name.."' from "..sender)
-            if mainFrame and mainFrame:IsShown() then RebuildMainRows() end
+
+            if mainFrame and mainFrame:IsShown() then RebuildMainGrid() end
             UpdateAssignFrame()
+
+            if IsRaidLeader() then CreateRLFrame() end
         end
     end
 end
 
 -------------------------------------------------------------------------------
--- DEATH NOTIFICATIONS
+-- DEATH DETECTION
 -------------------------------------------------------------------------------
-local deathFrame = CreateFrame("Frame", "HealAssignDeathFrame")
+local deathFrame = CreateFrame("Frame","HealAssignDeathFrame")
 deathFrame:RegisterEvent("CHAT_MSG_COMBAT_HOSTILE_DEATH")
 deathFrame:RegisterEvent("CHAT_MSG_COMBAT_FRIENDLY_DEATH")
-
-deathFrame:SetScript("OnEvent", function()
+deathFrame:SetScript("OnEvent",function()
     local msg = arg1
     if not msg then return end
 
-    local channelName = HealAssignDB and HealAssignDB.options and HealAssignDB.options.chatChannel
-    if not channelName or channelName == "" or channelName == "0" then return end
-    local channel = GetChannelName(channelName)
-    if not channel or channel == 0 then return end
-
-    local tmpl = GetActiveTemplate()
-    if not tmpl then return end
-
-    -- Extract dead player name (WoW 1.12.1 pattern)
     local deadName = nil
     if msg == "You die." then
         deadName = UnitName("player")
     else
-        local s, e, cap = string.find(msg, "^(.+) dies%.$")
-        if s then deadName = cap end
+        local _,_,cap = string.find(msg,"^(.+) dies%.$")
+        if cap then deadName = cap end
     end
-
     if not deadName then return end
 
-    -- Check if it's a tank in our template
-    for _, target in ipairs(tmpl.targets) do
-        if target.type == "tank" and target.value == deadName then
-            local healerList = ""
-            if table.getn(target.healers) > 0 then
-                healerList = table.concat(target.healers, ", ")
-            else
-                healerList = "none"
-            end
-            local notification = deadName.." (tank) dead - assigned healer(s): "..healerList
-            SendChatMessage(notification, "CHANNEL", nil, channel)
+    local tmpl = GetActiveTemplate()
+    if not tmpl then return end
+
+    local numRaid  = GetNumRaidMembers()
+    local numParty = GetNumPartyMembers()
+    if (not numRaid or numRaid == 0) and (not numParty or numParty == 0) then return end
+
+    for _,h in ipairs(tmpl.healers) do
+        if h.name == deadName then
+            local chan
+            if numRaid and numRaid > 0 then chan = "RAID"
+            elseif numParty and numParty > 0 then chan = "PARTY" end
+            if chan then pcall(SendAddonMessage, COMM_PREFIX,"DEAD;"..deadName, chan) end
+
+            TriggerHealerDeath(deadName, h.targets)
+            UpdateAssignFrame()
+            if rlFrame and rlFrame:IsShown() then UpdateRLFrame() end
             return
         end
     end
+end)
 
-    -- Check if it's an assigned healer
-    for _, target in ipairs(tmpl.targets) do
-        for _, healer in ipairs(target.healers) do
-            if healer == deadName then
-                local notification = deadName.." (healer) dead - was assigned to: "..target.value
-                SendChatMessage(notification, "CHANNEL", nil, channel)
-                return
+-- Ticker: only expire death alerts by time (15 sec)
+local alertTicker = CreateFrame("Frame","HealAssignTicker")
+local alertTickerElapsed = 0
+alertTicker:SetScript("OnUpdate",function()
+    alertTickerElapsed = alertTickerElapsed + arg1
+    if alertTickerElapsed >= 2 then
+        alertTickerElapsed = 0
+        if table.getn(deadHealers) > 0 then
+            RefreshAlertFrame()
+            UpdateAssignFrame()
+            if rlFrame and rlFrame:IsShown() then UpdateRLFrame() end
+        end
+    end
+end)
+
+-- Resurrection detection via combat log
+local rezFrame = CreateFrame("Frame","HealAssignRezFrame")
+rezFrame:RegisterEvent("CHAT_MSG_SPELL_RESURRECT")
+rezFrame:RegisterEvent("CHAT_MSG_SPELL_SELF_CASTOTHER")
+rezFrame:RegisterEvent("CHAT_MSG_SPELL_OTHER_CASTOTHER")
+rezFrame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
+rezFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+
+local function RemoveDeadHealer(name)
+    local newDead = {}
+    local changed = false
+    for _,d in ipairs(deadHealers) do
+        if d.name == name then changed = true
+        else table.insert(newDead, d) end
+    end
+    if changed then
+        deadHealers = newDead
+        RefreshAlertFrame()
+        UpdateAssignFrame()
+        if rlFrame and rlFrame:IsShown() then UpdateRLFrame() end
+    end
+end
+
+local function CheckAllRezd()
+    -- Called on zone change or entering world - check all dead healers
+    -- If healer has full health in raid, they're alive
+    if table.getn(deadHealers) == 0 then return end
+    local toRez = {}
+    for _,d in ipairs(deadHealers) do
+        -- Search in raid
+        for ri = 1, GetNumRaidMembers() do
+            local rname = UnitName("raid"..ri)
+            if rname == d.name then
+                local hp = UnitHealth("raid"..ri)
+                if hp and hp > 0 then
+                    table.insert(toRez, d.name)
+                end
+                break
+            end
+        end
+        -- Check self
+        if UnitName("player") == d.name then
+            if UnitHealth("player") > 0 then
+                table.insert(toRez, d.name)
             end
         end
     end
+    for _,name in ipairs(toRez) do
+        RemoveDeadHealer(name)
+    end
+end
+
+rezFrame:SetScript("OnEvent",function()
+    -- Zone change or entering world = mass rez (instance entry)
+    if event == "ZONE_CHANGED_NEW_AREA" or event == "PLAYER_ENTERING_WORLD" then
+        -- Small delay to let unit data load
+        local rezCheck = CreateFrame("Frame")
+        local rezElapsed = 0
+        rezCheck:SetScript("OnUpdate",function()
+            rezElapsed = rezElapsed + arg1
+            if rezElapsed >= 1.5 then
+                rezCheck:SetScript("OnUpdate",nil)
+                rezCheck:Hide()
+                CheckAllRezd()
+            end
+        end)
+        return
+    end
+
+    -- Combat log resurrection messages
+    local msg = arg1
+    if not msg then return end
+    local rezzed = nil
+    if string.find(msg, "^You have been resurrected") or string.find(msg, "^You are resurrected") then
+        rezzed = UnitName("player")
+    else
+        local _,_,cap = string.find(msg, "^(.+) is resurrected")
+        if not cap then _,_,cap = string.find(msg, "^(.+) comes back to life") end
+        if cap then rezzed = cap end
+    end
+    if rezzed then RemoveDeadHealer(rezzed) end
 end)
 
 -------------------------------------------------------------------------------
 -- MAIN EVENT HANDLER
 -------------------------------------------------------------------------------
-local eventFrame = CreateFrame("Frame", "HealAssignEventFrame")
+local eventFrame = CreateFrame("Frame","HealAssignEventFrame")
 eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("CHAT_MSG_ADDON")
 eventFrame:RegisterEvent("RAID_ROSTER_UPDATE")
 eventFrame:RegisterEvent("PARTY_MEMBERS_CHANGED")
 
-eventFrame:SetScript("OnEvent", function()
+
+eventFrame:SetScript("OnEvent",function()
     if event == "ADDON_LOADED" then
         if arg1 == ADDON_NAME then
             InitDB()
             if HealAssignDB.activeTemplate and HealAssignDB.templates[HealAssignDB.activeTemplate] then
                 currentTemplate = HealAssignDB.templates[HealAssignDB.activeTemplate]
+                if not currentTemplate.roster  then currentTemplate.roster  = {} end
+                if not currentTemplate.healers then currentTemplate.healers = {} end
             end
+            if not currentTemplate then currentTemplate = NewTemplate("") end
             CreateAssignFrame()
-            CreateOptionsFrame()
-            optionsFrame:Hide()
-            DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign|r v"..ADDON_VERSION.." loaded. Type |cffffffff/ha|r or |cffffffff/healassign|r to open.")
+            CreateAlertFrame()
+            -- Show assign frame only if already in raid (e.g. reloadui)
+            if GetNumRaidMembers() > 0 then UpdateAssignFrame() end
+            DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign|r v"..ADDON_VERSION.." loaded. |cffffffff/ha|r to open.")
         end
 
     elseif event == "CHAT_MSG_ADDON" then
-        HandleAddonMessage(arg1, arg2, arg3, arg4)
+        HandleAddonMessage(arg1,arg2,arg3,arg4)
 
     elseif event == "RAID_ROSTER_UPDATE" or event == "PARTY_MEMBERS_CHANGED" then
-        if mainFrame and mainFrame:IsShown() then
-            RebuildMainRows()
+        local inRaid = GetNumRaidMembers() > 0
+        -- Only update assign frame based on raid status (not party)
+        if assignFrame then
+            if inRaid then
+                UpdateAssignFrame()
+            else
+                local showOutside = HealAssignDB and HealAssignDB.options and HealAssignDB.options.showAssignFrame
+                if showOutside then
+                    UpdateAssignFrame()
+                else
+                    assignFrame:Hide()
+                end
+            end
         end
-        UpdateAssignFrame()
+        if inRaid then
+            if mainFrame and mainFrame:IsShown() then RebuildMainGrid() end
+            if rosterFrame and rosterFrame:IsShown() then RebuildRosterRows() end
+            if rlFrame and rlFrame:IsShown() then UpdateRLFrame() end
+        else
+            -- Left raid: close roster (stale data), keep main frame open
+            if rosterFrame and rosterFrame:IsShown() then rosterFrame:Hide() end
+            if rlFrame and rlFrame:IsShown() then rlFrame:Hide() end
+        end
     end
 end)
 
@@ -1596,51 +2206,49 @@ SlashCmdList["HEALASSIGN"] = function(msg)
         HealAssign_SyncTemplate()
 
     elseif msg == "options" or msg == "opt" then
-        if optionsFrame then
-            if optionsFrame:IsShown() then
-                optionsFrame:Hide()
-            else
-                optionsFrame:Show()
-            end
-        end
+        if optionsFrame and optionsFrame:IsShown() then optionsFrame:Hide()
+        else CreateOptionsFrame() end
 
     elseif msg == "assign" then
         if assignFrame then
-            if assignFrame:IsShown() then
-                assignFrame:Hide()
-            else
-                assignFrame:Show()
-                UpdateAssignFrame()
-            end
+            if assignFrame:IsShown() then assignFrame:Hide()
+            else assignFrame:Show() UpdateAssignFrame() end
         end
 
+    elseif msg == "rl" then
+        if rlFrame and rlFrame:IsShown() then rlFrame:Hide()
+        else CreateRLFrame() end
+
     elseif msg == "help" then
-        DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign|r v"..ADDON_VERSION.." commands:")
-        DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/ha|r - Toggle main window")
-        DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/ha sync|r - Sync active template to raid/party")
-        DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/ha options|r - Open options")
-        DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/ha assign|r - Toggle my assignments display")
-        DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/ha help|r - Show this help")
+        DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign|r v"..ADDON_VERSION.."  commands:")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/ha|r            - Toggle main window")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/ha sync|r       - Sync template to group")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/ha options|r    - Options")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/ha assign|r     - Toggle my assignments frame")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/ha rl|r         - Toggle raid leader view")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/ha help|r       - This help")
 
     else
-        -- Toggle main frame
+        if not HasEditorRights() then
+            DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Only Raid Leader or Assistant can open the editor.")
+            return
+        end
         if mainFrame then
             if mainFrame:IsShown() then
                 mainFrame:Hide()
                 CloseDropdown()
+                if rosterFrame then rosterFrame:Hide() end
             else
                 mainFrame:Show()
-                if currentTemplate then
-                    mainFrame.nameEdit:SetText(currentTemplate.name)
-                    RebuildMainRows()
+                mainFrame:Raise()
+                if mainFrame.nameEdit and currentTemplate then
+                    mainFrame.nameEdit:SetText(currentTemplate.name or "")
                 end
+                RebuildMainGrid()
+                PushWindow(mainFrame)
             end
         else
             CreateMainFrame()
-            if currentTemplate then
-                mainFrame.nameEdit:SetText(currentTemplate.name)
-                RebuildMainRows()
-            end
         end
     end
 end
