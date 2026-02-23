@@ -2,11 +2,12 @@
 ## Title: HealAssign
 ## Notes: Raid heal assignment tool - assign healers to tanks and groups
 ## Author: HealAssign
-## Version: 1.0.4
+## Version: 2.0.0
 ## SavedVariables: HealAssignDB
 
 
 HealAssign.lua
+
 
 
 
