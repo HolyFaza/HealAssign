@@ -6,7 +6,7 @@
 -- CONSTANTS
 -------------------------------------------------------------------------------
 local ADDON_NAME    = "HealAssign"
-local ADDON_VERSION = "2.0.0"
+local ADDON_VERSION = "2.0.1"
 local COMM_PREFIX   = "HealAssign"
 
 local CLASS_COLORS = {
@@ -512,7 +512,7 @@ local function CreateAlertFrame()
 
     alertFrame = CreateFrame("Frame","HealAssignAlertFrame",UIParent)
     alertFrame:SetWidth(600)
-    alertFrame:SetHeight(80)
+    alertFrame:SetHeight(44)
     alertFrame:SetPoint("TOP",UIParent,"TOP",0,-120)
     alertFrame:SetFrameStrata("FULLSCREEN_DIALOG")
     alertFrame:Hide()
@@ -528,7 +528,7 @@ local function CreateAlertFrame()
 
     local header = alertFrame:CreateFontString(nil,"OVERLAY","GameFontNormalHuge")
     header:SetFont("Fonts\\FRIZQT__.TTF", 22, "OUTLINE")
-    header:SetPoint("TOP",alertFrame,"TOP",0,-10)
+    header:SetPoint("CENTER",alertFrame,"CENTER",0,0)
     header:SetTextColor(1,0.1,0.1)
     alertFrame.header = header
 
@@ -1261,14 +1261,39 @@ local function RebuildRosterRows()
     if not tmpl then return end
 
     local members = GetRaidMembers()
-    -- Sync new members into roster
+    -- Build lookup of current raid members
+    local currentMembers = {}
+    for _,m in ipairs(members) do
+        currentMembers[m.name] = m
+    end
+    -- Remove players no longer in raid (keeps roster clean between raids)
+    local toRemove = {}
+    for pname,_ in pairs(tmpl.roster) do
+        if not currentMembers[pname] then
+            table.insert(toRemove, pname)
+        end
+    end
+    for _,pname in ipairs(toRemove) do
+        tmpl.roster[pname] = nil
+    end
+    -- Add new members, update existing
     for _,m in ipairs(members) do
         if not tmpl.roster[m.name] then
-            tmpl.roster[m.name] = {class=m.class, tag=nil, subgroup=m.subgroup or 1}
+            tmpl.roster[m.name] = {class=m.class, subgroup=m.subgroup or 1}
         else
             tmpl.roster[m.name].class    = m.class
             tmpl.roster[m.name].subgroup = m.subgroup or tmpl.roster[m.name].subgroup or 1
         end
+    end
+    -- Also sync healers list - remove healers no longer in raid
+    if tmpl.healers then
+        local newHealers = {}
+        for _,h in ipairs(tmpl.healers) do
+            if currentMembers[h.name] then
+                table.insert(newHealers, h)
+            end
+        end
+        tmpl.healers = newHealers
     end
 
     -- Build groups 1-8
