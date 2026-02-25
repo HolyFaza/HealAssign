@@ -102,3 +102,11 @@ Designed for raid leaders and healers to manage and display healing assignments 
 
 ### v1.x
 - Target-centric layout, basic assignment and sync
+
+---
+
+## Credits
+
+**Death alert sound:** "Metal Bucket Kicked" by [deathpunk](https://freesound.org/people/deathpunk/)
+Source: https://freesound.org/s/795710/
+License: [Attribution 4.0](https://creativecommons.org/licenses/by/4.0/)
