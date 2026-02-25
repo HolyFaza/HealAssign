@@ -6,7 +6,7 @@
 -- CONSTANTS
 -------------------------------------------------------------------------------
 local ADDON_NAME    = "HealAssign"
-local ADDON_VERSION = "2.0.1"
+local ADDON_VERSION = "2.0.2"
 local COMM_PREFIX   = "HealAssign"
 
 local CLASS_COLORS = {
@@ -599,7 +599,7 @@ local function TriggerHealerDeath(healerName, targets)
     if not shouldShow then return end
 
     -- Play sound
-    PlaySoundFile("Interface\\Buttons\\UI-RaidTargetingWarning.wav")
+    PlaySoundFile("Interface\\AddOns\\HealAssign\\Sounds\\bucket.wav")
 
     -- Show DBM-style alert
     if not alertFrame then CreateAlertFrame() end
