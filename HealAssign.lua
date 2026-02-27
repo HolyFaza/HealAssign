@@ -6,7 +6,7 @@
 -- CONSTANTS
 -------------------------------------------------------------------------------
 local ADDON_NAME    = "HealAssign"
-local ADDON_VERSION = "2.0.3"
+local ADDON_VERSION = "2.0.2"
 local COMM_PREFIX   = "HealAssign"
 
 local CLASS_COLORS = {
@@ -754,15 +754,14 @@ local function UpdateAssignFrame()
         end
     end
 
-    -- Adjust frame width based on font size
-    local frameW = 130 + (fontSize - 8) * 7
+    -- Frame width scales cleanly with font size
+    local frameW
     if isViewer then
-        -- Viewer needs extra width for innervate section (druid -> healer)
-        if frameW < 180 then frameW = 180 end
-        if frameW > 320 then frameW = 320 end
+        -- Viewer: wider to fit two-column table
+        frameW = math.max(200, math.min(380, fontSize * 18))
     else
-        if frameW < 120 then frameW = 120 end
-        if frameW > 240 then frameW = 240 end
+        -- Healer/druid: single-column, narrower
+        frameW = math.max(130, math.min(260, fontSize * 13))
     end
     assignFrame:SetWidth(frameW)
 
@@ -807,108 +806,192 @@ local function UpdateAssignFrame()
     titleFS:SetText(isViewer and "Assignments" or myName)
     table.insert(assignFrame.content,titleFS)
 
-    -- Viewer (V tag): two sections
+    -- Viewer (V tag): table layout
     if isViewer and tmpl then
-        -- Section 1: Healer Assignments (Target -> Healers)
-        AddRow("Healer Assignments", 1,0.8,0.2)
-        local targetOrder,targetMeta,targetHeals,seen = {},{},{},{}
+        -- Table layout constants
+        local PAD      = 6
+        local innerW   = frameW - PAD*2
+        local colL     = math.floor(innerW * 0.44)  -- left col: target name
+        local colR     = innerW - colL - 1           -- right col: healer name(s)
+        local divX     = PAD + colL                  -- X position of vertical divider
+
+        -- Helper: add a horizontal separator line
+        local function AddDivider(r,g,b,a)
+            local div = assignFrame:CreateTexture(nil,"ARTWORK")
+            div:SetHeight(1)
+            div:SetPoint("TOPLEFT",  assignFrame,"TOPLEFT",  PAD,   yOff)
+            div:SetPoint("TOPRIGHT", assignFrame,"TOPRIGHT", -PAD,  yOff)
+            div:SetTexture(r or 0.3, g or 0.3, b or 0.3, a or 0.35)
+            table.insert(assignFrame.content, div)
+            yOff = yOff - 2
+        end
+
+        -- Helper: add one two-column table row
+        -- leftText/leftR,G,B  rightText/rightR,G,B  bgR,bgG,bgB (optional zebra)
+        local function AddTableRow(leftText,lr,lg,lb, rightText,rr,rg,rb, bgR,bgG,bgB)
+            local row = CreateFrame("Frame",nil,assignFrame)
+            row:SetPoint("TOPLEFT", assignFrame,"TOPLEFT", PAD, yOff)
+            row:SetWidth(innerW)
+            row:SetHeight(rowH)
+            if bgR then
+                row:SetBackdrop({bgFile="Interface\Buttons\WHITE8X8",
+                    insets={left=0,right=0,top=0,bottom=0}})
+                row:SetBackdropColor(bgR,bgG,bgB,0.12)
+            end
+            table.insert(assignFrame.content, row)
+
+            -- Left cell
+            local fsL = row:CreateFontString(nil,"OVERLAY")
+            fsL:SetFont("Fonts\FRIZQT__.TTF",fontSize,"")
+            fsL:SetPoint("LEFT",row,"LEFT",4,0)
+            fsL:SetWidth(colL - 6)
+            fsL:SetJustifyH("LEFT")
+            fsL:SetTextColor(lr or 1, lg or 1, lb or 1)
+            fsL:SetText(leftText or "")
+
+            -- Vertical divider line
+            local vdiv = row:CreateTexture(nil,"ARTWORK")
+            vdiv:SetWidth(1)
+            vdiv:SetPoint("TOPLEFT",    row,"TOPLEFT",  colL, 0)
+            vdiv:SetPoint("BOTTOMLEFT", row,"BOTTOMLEFT",colL, 0)
+            vdiv:SetTexture(0.3,0.3,0.3,0.4)
+
+            -- Right cell
+            local fsR = row:CreateFontString(nil,"OVERLAY")
+            fsR:SetFont("Fonts\FRIZQT__.TTF",fontSize,"")
+            fsR:SetPoint("LEFT",row,"LEFT",colL+4,0)
+            fsR:SetWidth(colR - 6)
+            fsR:SetJustifyH("LEFT")
+            fsR:SetTextColor(rr or 0.8, rg or 0.8, rb or 0.8)
+            fsR:SetText(rightText or "")
+
+            yOff = yOff - rowStep
+        end
+
+        -- Helper: section header (full-width, colored background)
+        local function AddSectionHeader(text, r,g,b, iconTex)
+            local hdr = CreateFrame("Frame",nil,assignFrame)
+            hdr:SetPoint("TOPLEFT", assignFrame,"TOPLEFT", PAD, yOff)
+            hdr:SetWidth(innerW)
+            hdr:SetHeight(rowH + 2)
+            hdr:SetBackdrop({bgFile="Interface\Buttons\WHITE8X8",
+                insets={left=0,right=0,top=0,bottom=0}})
+            hdr:SetBackdropColor(r*0.18, g*0.18, b*0.18, 0.55)
+            table.insert(assignFrame.content, hdr)
+
+            local xOff = 4
+            if iconTex then
+                local ic = hdr:CreateTexture(nil,"ARTWORK")
+                ic:SetWidth(fontSize)
+                ic:SetHeight(fontSize)
+                ic:SetPoint("LEFT",hdr,"LEFT",4,0)
+                ic:SetTexture(iconTex)
+                xOff = fontSize + 6
+            end
+            local fs = hdr:CreateFontString(nil,"OVERLAY")
+            fs:SetFont("Fonts\FRIZQT__.TTF",fontSize,"OUTLINE")
+            fs:SetPoint("LEFT",hdr,"LEFT",xOff,0)
+            fs:SetTextColor(r,g,b)
+            fs:SetText(text)
+            yOff = yOff - (rowH + 4)
+        end
+
+        -- ── Section 1: Healer Assignments ──────────────────────────────
+        AddSectionHeader("Healer Assignments", 1,0.8,0.2)
+
+        -- Collect targets: tanks first (sorted), then groups (sorted), then custom
+        local tankTargets2, groupTargets2, customTargets2 = {},{},{}
+        local targetMeta2, targetHeals2, seen2 = {},{},{}
         for _,h in ipairs(tmpl.healers) do
             for _,t in ipairs(h.targets) do
                 local key = (t.type or "").."~"..(t.value or "")
-                if not seen[key] then
-                    seen[key]=true
-                    table.insert(targetOrder,key)
-                    targetMeta[key]={display=GetTargetDisplayText(t),ttype=t.type,tvalue=t.value}
-                    targetHeals[key]={}
+                if not seen2[key] then
+                    seen2[key] = true
+                    targetMeta2[key] = {display=GetTargetDisplayText(t), ttype=t.type, tvalue=t.value}
+                    targetHeals2[key] = {}
+                    if t.type == TYPE_TANK        then table.insert(tankTargets2,  key)
+                    elseif t.type == TYPE_GROUP   then table.insert(groupTargets2, key)
+                    else                               table.insert(customTargets2, key) end
                 end
-                table.insert(targetHeals[key],h.name)
+                table.insert(targetHeals2[key], h.name)
             end
         end
-        if table.getn(targetOrder)==0 then
-            AddRow("  (no assignments)",0.5,0.5,0.5)
+        table.sort(tankTargets2,   function(a,b) return targetMeta2[a].tvalue < targetMeta2[b].tvalue end)
+        table.sort(groupTargets2,  function(a,b)
+            local na, nb = tonumber(targetMeta2[a].tvalue), tonumber(targetMeta2[b].tvalue)
+            return (na or 0) < (nb or 0)
+        end)
+        table.sort(customTargets2, function(a,b) return targetMeta2[a].display < targetMeta2[b].display end)
+
+        local orderedTargets2 = {}
+        for _,k in ipairs(tankTargets2)   do table.insert(orderedTargets2,k) end
+        for _,k in ipairs(groupTargets2)  do table.insert(orderedTargets2,k) end
+        for _,k in ipairs(customTargets2) do table.insert(orderedTargets2,k) end
+
+        if table.getn(orderedTargets2) == 0 then
+            AddTableRow("(no assignments)",0.5,0.5,0.5, "",0.5,0.5,0.5)
         else
-            for _,key in ipairs(targetOrder) do
-                local m=targetMeta[key]
-                local tr2,tg2,tb2=0.88,0.88,0.88
-                if m.ttype==TYPE_TANK then
-                    if tmpl.roster and tmpl.roster[m.tvalue] then tr2,tg2,tb2=GetClassColor(tmpl.roster[m.tvalue].class) end
-                elseif m.ttype==TYPE_GROUP  then tr2,tg2,tb2=0.5,0.85,1.0
-                elseif m.ttype==TYPE_CUSTOM then tr2,tg2,tb2=0.9,0.6,1.0
+            local zebra = false
+            for _,key in ipairs(orderedTargets2) do
+                local m   = targetMeta2[key]
+                local heals = targetHeals2[key]
+                -- target color
+                local tcR,tcG,tcB = 0.88,0.88,0.88
+                if m.ttype == TYPE_TANK then
+                    if tmpl.roster and tmpl.roster[m.tvalue] then
+                        tcR,tcG,tcB = GetClassColor(tmpl.roster[m.tvalue].class)
+                    end
+                elseif m.ttype == TYPE_GROUP  then tcR,tcG,tcB = 0.5,0.85,1.0
+                elseif m.ttype == TYPE_CUSTOM then tcR,tcG,tcB = 0.9,0.6, 1.0
                 end
-                AddRow(m.display,tr2,tg2,tb2)
-                for _,hname in ipairs(targetHeals[key]) do
-                    local hr2,hg2,hb2=1,1,1
-                    if tmpl.roster and tmpl.roster[hname] then hr2,hg2,hb2=GetClassColor(tmpl.roster[hname].class) end
+                for hi,hname in ipairs(heals) do
+                    local hr2,hg2,hb2 = 1,1,1
+                    if tmpl.roster and tmpl.roster[hname] then
+                        hr2,hg2,hb2 = GetClassColor(tmpl.roster[hname].class)
+                    end
                     local isDead = false
-                    for _,dd in ipairs(deadHealers) do if dd.name==hname then isDead=true break end end
-                    if isDead then hr2,hg2,hb2=1,0.1,0.1 end
-                    AddRow("  "..hname,hr2,hg2,hb2)
+                    for _,dd in ipairs(deadHealers) do
+                        if dd.name == hname then isDead=true break end
+                    end
+                    if isDead then hr2,hg2,hb2 = 1,0.15,0.15 end
+                    -- First healer in the group gets the target label; rest get empty left cell
+                    local leftLabel = (hi == 1) and m.display or ""
+                    local leftR,leftG,leftB = (hi==1) and tcR or 0, (hi==1) and tcG or 0, (hi==1) and tcB or 0
+                    local bgR,bgG,bgB = zebra and 0.3 or nil, zebra and 0.3 or nil, zebra and 0.3 or nil
+                    if isDead then bgR,bgG,bgB = 0.5,0.05,0.05 end
+                    AddTableRow(leftLabel, leftR,leftG,leftB,
+                                hname,     hr2,hg2,hb2,
+                                bgR,bgG,bgB)
                 end
+                zebra = not zebra
             end
         end
 
-        -- Section 2: Innervate Assignments
+        -- ── Section 2: Innervate ───────────────────────────────────────
         if tmpl.innervate and next(tmpl.innervate) then
-            yOff = yOff - 4
-            -- Header row with icon inline
-            local hdrRow = CreateFrame("Frame",nil,assignFrame)
-            hdrRow:SetPoint("TOPLEFT",assignFrame,"TOPLEFT",6,yOff)
-            hdrRow:SetWidth(assignFrame:GetWidth()-12)
-            hdrRow:SetHeight(rowH)
-            table.insert(assignFrame.content,hdrRow)
-            local hdrIcon = hdrRow:CreateTexture(nil,"ARTWORK")
-            hdrIcon:SetWidth(fontSize)
-            hdrIcon:SetHeight(fontSize)
-            hdrIcon:SetPoint("LEFT",hdrRow,"LEFT",4,0)
-            hdrIcon:SetTexture(INN_ICON)
-            local hdrFS = hdrRow:CreateFontString(nil,"OVERLAY")
-            hdrFS:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
-            hdrFS:SetPoint("LEFT",hdrRow,"LEFT",fontSize+8,0)
-            hdrFS:SetTextColor(1,0.8,0.2)
-            hdrFS:SetText("Innervate")
-            yOff = yOff - rowStep
-            -- Build sorted list
-            local innList = {}
+            AddDivider(0.4,0.3,0.1, 0.6)
+            AddSectionHeader("Innervate", 1,0.65,0.1, INN_ICON)
+
+            local innList2 = {}
             for dn,hn in pairs(tmpl.innervate) do
-                table.insert(innList,{druid=dn,healer=hn})
+                table.insert(innList2, {druid=dn, healer=hn})
             end
-            table.sort(innList,function(a,b) return a.druid<b.druid end)
-            for _,pair in ipairs(innList) do
+            table.sort(innList2, function(a,b) return a.druid < b.druid end)
+            local zebra2 = false
+            for _,pair in ipairs(innList2) do
                 local vdr,vdg,vdb = GetClassColor("DRUID")
                 local vhr,vhg,vhb = 1,1,1
                 if tmpl.roster and tmpl.roster[pair.healer] then
                     vhr,vhg,vhb = GetClassColor(tmpl.roster[pair.healer].class)
                 end
-                -- FIX 2: single row, druid LEFT half, healer RIGHT half, no arrow separator
-                local vRow = CreateFrame("Frame",nil,assignFrame)
-                vRow:SetPoint("TOPLEFT",assignFrame,"TOPLEFT",6,yOff)
-                vRow:SetWidth(assignFrame:GetWidth()-12)
-                vRow:SetHeight(rowH)
-                table.insert(assignFrame.content,vRow)
-                local rowW = assignFrame:GetWidth()-12
-                local halfW = math.floor(rowW/2) - 4
-                -- Druid name occupies left half
-                local vFS = vRow:CreateFontString(nil,"OVERLAY")
-                vFS:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
-                vFS:SetPoint("LEFT",vRow,"LEFT",6,0)
-                vFS:SetWidth(halfW)
-                vFS:SetJustifyH("LEFT")
-                vFS:SetTextColor(vdr,vdg,vdb)
-                vFS:SetText(pair.druid)
-                -- Healer name occupies right half
-                local vHFS = vRow:CreateFontString(nil,"OVERLAY")
-                vHFS:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
-                vHFS:SetPoint("RIGHT",vRow,"RIGHT",-4,0)
-                vHFS:SetWidth(halfW)
-                vHFS:SetJustifyH("RIGHT")
-                vHFS:SetTextColor(vhr,vhg,vhb)
-                vHFS:SetText(pair.healer)
-                yOff = yOff - rowStep
+                local bgR,bgG,bgB = zebra2 and 0.3 or nil, zebra2 and 0.3 or nil, zebra2 and 0.3 or nil
+                AddTableRow(pair.druid, vdr,vdg,vdb, pair.healer, vhr,vhg,vhb, bgR,bgG,bgB)
+                zebra2 = not zebra2
             end
         end
 
-        local totalH=math.abs(yOff)+rowStep
-        if totalH<titleH+rowStep then totalH=titleH+rowStep end
+        local totalH = math.abs(yOff) + rowStep + 4
+        if totalH < titleH + rowStep then totalH = titleH + rowStep end
         assignFrame:SetHeight(totalH)
         assignFrame:Show()
         return
@@ -1346,107 +1429,184 @@ local function UpdateRLFrame()
     local deadSet = {}
     for _,d in ipairs(deadHealers) do deadSet[d.name] = true end
 
-    -- FIX 6: reorganize display - group by target (tanks first, then groups)
-    -- Build ordered list of unique targets: tanks sorted by name, then groups sorted by number
-    local tankTargets  = {}   -- {key, display, ttype, tvalue}
-    local groupTargets = {}
-    local targetSeen   = {}
+    local fontSize = (HealAssignDB and HealAssignDB.options and HealAssignDB.options.fontSize) or 12
+    local frameW   = math.max(200, math.min(380, fontSize * 18))
+    local PAD      = 6
+    local rowH     = fontSize + 4
+    local rowStep  = fontSize + 5
+    local innerW   = frameW - PAD*2
+    local colL     = math.floor(innerW * 0.44)
+    local colR     = innerW - colL - 1
+    local yOff     = -(fontSize + 14)   -- below title
+
+    rlFrame:SetWidth(frameW)
+
+    -- Helper: horizontal divider
+    local function RLDivider(r,g,b,a)
+        local div = rlFrame:CreateTexture(nil,"ARTWORK")
+        div:SetHeight(1)
+        div:SetPoint("TOPLEFT",  rlFrame,"TOPLEFT",  PAD,  yOff)
+        div:SetPoint("TOPRIGHT", rlFrame,"TOPRIGHT", -PAD, yOff)
+        div:SetTexture(r or 0.3, g or 0.3, b or 0.3, a or 0.35)
+        table.insert(rlFrame.content, div)
+        yOff = yOff - 2
+    end
+
+    -- Helper: section header with colored background
+    local function RLSectionHeader(text, r,g,b, iconTex)
+        local hdr = CreateFrame("Frame",nil,rlFrame)
+        hdr:SetPoint("TOPLEFT", rlFrame,"TOPLEFT", PAD, yOff)
+        hdr:SetWidth(innerW)
+        hdr:SetHeight(rowH + 2)
+        hdr:SetBackdrop({bgFile="Interface\Buttons\WHITE8X8",
+            insets={left=0,right=0,top=0,bottom=0}})
+        hdr:SetBackdropColor(r*0.18, g*0.18, b*0.18, 0.55)
+        table.insert(rlFrame.content, hdr)
+        local xOff = 4
+        if iconTex then
+            local ic = hdr:CreateTexture(nil,"ARTWORK")
+            ic:SetWidth(fontSize) ic:SetHeight(fontSize)
+            ic:SetPoint("LEFT",hdr,"LEFT",4,0)
+            ic:SetTexture(iconTex)
+            xOff = fontSize + 6
+        end
+        local fs = hdr:CreateFontString(nil,"OVERLAY")
+        fs:SetFont("Fonts\FRIZQT__.TTF",fontSize,"OUTLINE")
+        fs:SetPoint("LEFT",hdr,"LEFT",xOff,0)
+        fs:SetTextColor(r,g,b)
+        fs:SetText(text)
+        yOff = yOff - (rowH + 4)
+    end
+
+    -- Helper: two-column table row
+    local function RLTableRow(leftText,lr,lg,lb, rightText,rr,rg,rb, bgR,bgG,bgB)
+        local row = CreateFrame("Frame",nil,rlFrame)
+        row:SetPoint("TOPLEFT", rlFrame,"TOPLEFT", PAD, yOff)
+        row:SetWidth(innerW)
+        row:SetHeight(rowH)
+        if bgR then
+            row:SetBackdrop({bgFile="Interface\Buttons\WHITE8X8",
+                insets={left=0,right=0,top=0,bottom=0}})
+            row:SetBackdropColor(bgR,bgG,bgB,0.12)
+        end
+        table.insert(rlFrame.content, row)
+
+        local fsL = row:CreateFontString(nil,"OVERLAY")
+        fsL:SetFont("Fonts\FRIZQT__.TTF",fontSize,"")
+        fsL:SetPoint("LEFT",row,"LEFT",4,0)
+        fsL:SetWidth(colL - 6)
+        fsL:SetJustifyH("LEFT")
+        fsL:SetTextColor(lr or 1,lg or 1,lb or 1)
+        fsL:SetText(leftText or "")
+
+        local vdiv = row:CreateTexture(nil,"ARTWORK")
+        vdiv:SetWidth(1)
+        vdiv:SetPoint("TOPLEFT",    row,"TOPLEFT",   colL,0)
+        vdiv:SetPoint("BOTTOMLEFT", row,"BOTTOMLEFT",colL,0)
+        vdiv:SetTexture(0.3,0.3,0.3,0.4)
+
+        local fsR = row:CreateFontString(nil,"OVERLAY")
+        fsR:SetFont("Fonts\FRIZQT__.TTF",fontSize,"")
+        fsR:SetPoint("LEFT",row,"LEFT",colL+4,0)
+        fsR:SetWidth(colR - 6)
+        fsR:SetJustifyH("LEFT")
+        fsR:SetTextColor(rr or 0.8,rg or 0.8,rb or 0.8)
+        fsR:SetText(rightText or "")
+
+        yOff = yOff - rowStep
+    end
+
+    -- ── Section 1: Healer Assignments ─────────────────────────────
+    RLSectionHeader("Healer Assignments", 1,0.8,0.2)
+
+    -- Collect targets: tanks first, groups second, custom third
+    local tankT,groupT,customT = {},{},{}
+    local tMeta,tHeals,tSeen = {},{},{}
     for _,h in ipairs(tmpl.healers) do
         for _,t in ipairs(h.targets or {}) do
             local key = (t.type or "").."~"..(t.value or "")
-            if not targetSeen[key] then
-                targetSeen[key] = true
-                local entry = {key=key, display=GetTargetDisplayText(t), ttype=t.type, tvalue=t.value}
-                if t.type == TYPE_TANK then
-                    table.insert(tankTargets, entry)
-                elseif t.type == TYPE_GROUP then
-                    table.insert(groupTargets, entry)
-                end
+            if not tSeen[key] then
+                tSeen[key] = true
+                tMeta[key] = {display=GetTargetDisplayText(t), ttype=t.type, tvalue=t.value}
+                tHeals[key] = {}
+                if t.type==TYPE_TANK      then table.insert(tankT,  key)
+                elseif t.type==TYPE_GROUP then table.insert(groupT, key)
+                else                           table.insert(customT,key) end
             end
+            table.insert(tHeals[key], h.name)
         end
     end
-    table.sort(tankTargets,  function(a,b) return a.tvalue < b.tvalue end)
-    table.sort(groupTargets, function(a,b) return tonumber(a.tvalue) < tonumber(b.tvalue) end)
+    table.sort(tankT,   function(a,b) return tMeta[a].tvalue < tMeta[b].tvalue end)
+    table.sort(groupT,  function(a,b)
+        local na,nb = tonumber(tMeta[a].tvalue), tonumber(tMeta[b].tvalue)
+        return (na or 0) < (nb or 0)
+    end)
+    table.sort(customT, function(a,b) return tMeta[a].display < tMeta[b].display end)
 
-    local yOff = -30
-    local function AddRLRow(text,indent,r,g,b)
-        local fs = rlFrame:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
-        fs:SetPoint("TOPLEFT",rlFrame,"TOPLEFT",10 + (indent or 0)*14,yOff)
-        fs:SetTextColor(r or 1,g or 1,b or 1)
-        fs:SetText(text)
-        yOff = yOff - 16
-        table.insert(rlFrame.content, fs)
-    end
+    local orderedT = {}
+    for _,k in ipairs(tankT)   do table.insert(orderedT,k) end
+    for _,k in ipairs(groupT)  do table.insert(orderedT,k) end
+    for _,k in ipairs(customT) do table.insert(orderedT,k) end
 
-    -- Helper: find all healers assigned to a given target key
-    local function HealersForTarget(targetKey)
-        local out = {}
-        for _,h in ipairs(tmpl.healers) do
-            for _,t in ipairs(h.targets or {}) do
-                local k = (t.type or "").."~"..(t.value or "")
-                if k == targetKey then
-                    table.insert(out, h.name)
-                    break
+    if table.getn(orderedT) == 0 then
+        RLTableRow("(no assignments)",0.5,0.5,0.5, "",0.5,0.5,0.5)
+    else
+        local zebra = false
+        for _,key in ipairs(orderedT) do
+            local m = tMeta[key]
+            local tcR,tcG,tcB = 0.88,0.88,0.88
+            if m.ttype==TYPE_TANK then
+                if tmpl.roster and tmpl.roster[m.tvalue] then
+                    tcR,tcG,tcB = GetClassColor(tmpl.roster[m.tvalue].class)
                 end
+            elseif m.ttype==TYPE_GROUP  then tcR,tcG,tcB = 0.5,0.85,1.0
+            elseif m.ttype==TYPE_CUSTOM then tcR,tcG,tcB = 0.9,0.6, 1.0
             end
-        end
-        table.sort(out)
-        return out
-    end
-
-    -- Render tanks section
-    if table.getn(tankTargets) > 0 then
-        for _,tgt in ipairs(tankTargets) do
-            -- Tank header row: class color from roster if available
-            local tr,tg,tb = 0.78,0.61,0.43   -- warrior gold as default tank color
-            if tmpl.roster and tmpl.roster[tgt.tvalue] then
-                tr,tg,tb = GetClassColor(tmpl.roster[tgt.tvalue].class)
-            end
-            AddRLRow(tgt.display, 0, tr,tg,tb)
-            for _,hname in ipairs(HealersForTarget(tgt.key)) do
+            for hi,hname in ipairs(tHeals[key]) do
                 local hr2,hg2,hb2 = 1,1,1
                 if tmpl.roster and tmpl.roster[hname] then
                     hr2,hg2,hb2 = GetClassColor(tmpl.roster[hname].class)
                 end
-                local suffix = deadSet[hname] and "  [DEAD]" or ""
-                local dr2,dg2,db2 = deadSet[hname] and 1 or hr2, deadSet[hname] and 0.2 or hg2, deadSet[hname] and 0.2 or hb2
-                AddRLRow(hname..suffix, 1, dr2,dg2,db2)
+                local isDead = deadSet[hname]
+                if isDead then hr2,hg2,hb2 = 1,0.15,0.15 end
+                local leftLabel = (hi==1) and m.display or ""
+                local leftR = (hi==1) and tcR or 0
+                local leftG = (hi==1) and tcG or 0
+                local leftB = (hi==1) and tcB or 0
+                local bgR,bgG,bgB = zebra and 0.3 or nil, zebra and 0.3 or nil, zebra and 0.3 or nil
+                if isDead then bgR,bgG,bgB = 0.5,0.05,0.05 end
+                RLTableRow(leftLabel,leftR,leftG,leftB, hname,hr2,hg2,hb2, bgR,bgG,bgB)
             end
+            zebra = not zebra
         end
     end
 
-    -- Render groups section
-    if table.getn(groupTargets) > 0 then
-        for _,tgt in ipairs(groupTargets) do
-            AddRLRow(tgt.display, 0, 0.5,0.85,1.0)
-            for _,hname in ipairs(HealersForTarget(tgt.key)) do
-                local hr2,hg2,hb2 = 1,1,1
-                if tmpl.roster and tmpl.roster[hname] then
-                    hr2,hg2,hb2 = GetClassColor(tmpl.roster[hname].class)
-                end
-                local suffix = deadSet[hname] and "  [DEAD]" or ""
-                local dr2,dg2,db2 = deadSet[hname] and 1 or hr2, deadSet[hname] and 0.2 or hg2, deadSet[hname] and 0.2 or hb2
-                AddRLRow(hname..suffix, 1, dr2,dg2,db2)
+    -- ── Section 2: Innervate ──────────────────────────────────────
+    if tmpl.innervate and next(tmpl.innervate) then
+        RLDivider(0.4,0.3,0.1,0.6)
+        RLSectionHeader("Innervate", 1,0.65,0.1, INN_ICON)
+
+        local innList = {}
+        for dn,hn in pairs(tmpl.innervate) do
+            table.insert(innList, {druid=dn, healer=hn})
+        end
+        table.sort(innList, function(a,b) return a.druid < b.druid end)
+        local zebra = false
+        for _,pair in ipairs(innList) do
+            local vdr,vdg,vdb = GetClassColor("DRUID")
+            local vhr,vhg,vhb = 1,1,1
+            if tmpl.roster and tmpl.roster[pair.healer] then
+                vhr,vhg,vhb = GetClassColor(tmpl.roster[pair.healer].class)
             end
+            local bgR,bgG,bgB = zebra and 0.3 or nil, zebra and 0.3 or nil, zebra and 0.3 or nil
+            RLTableRow(pair.druid,vdr,vdg,vdb, pair.healer,vhr,vhg,vhb, bgR,bgG,bgB)
+            zebra = not zebra
         end
     end
 
-    -- Fallback: if no tank/group targets, show plain healer list
-    if table.getn(tankTargets) == 0 and table.getn(groupTargets) == 0 then
-        for _,h in ipairs(tmpl.healers) do
-            local hr2,hg2,hb2 = 1,1,1
-            if tmpl.roster and tmpl.roster[h.name] then
-                hr2,hg2,hb2 = GetClassColor(tmpl.roster[h.name].class)
-            end
-            local suffix = deadSet[h.name] and "  [DEAD]" or ""
-            AddRLRow(h.name..suffix, 0, hr2,hg2,hb2)
-        end
-    end
-
-    -- Resize frame to content
-    local totalH = math.abs(yOff) + 20
+    -- Resize to content
+    local totalH = math.abs(yOff) + rowStep + 4
     if totalH < 80 then totalH = 80 end
-    rlFrame:SetWidth(220)
     rlFrame:SetHeight(totalH)
     rlFrame:Show()
 end
@@ -3137,18 +3297,26 @@ innTicker:SetScript("OnUpdate",function()
     local amDruid = myPdata3 and myPdata3.class == "DRUID" and not myPdata3.tagH
     if amDruid and tmpl.innervate and tmpl.innervate[myName] then
         UpdateDruidAssignFrame()
-        -- FIX 3: BigWigs-style green alert when assigned healer drops below 50% mana
+        -- BigWigs-style green alert when assigned healer drops below 50% mana.
+        -- Alert fires only once per CD cycle: after casting Innervate the alert is
+        -- suppressed for the entire cooldown duration, then resets when CD expires.
         local assignedH = tmpl.innervate[myName]
-        local mPct = INN_GetHealerMana(assignedH)
-        if mPct and mPct < 50 then
-            -- Only fire once per low-mana event; reset when mana recovers above 60%
-            if not INN_ALERT_SHOWN[myName] then
-                INN_ALERT_SHOWN[myName] = true
-                INN_ShowAlert(assignedH, mPct)
+        local mPct      = INN_GetHealerMana(assignedH)
+        local cdRem     = INN_GetCDRemaining(myName)
+        if cdRem > 0 then
+            -- Innervate on cooldown: suppress all alerts until CD expires
+            INN_ALERT_SHOWN[myName] = true
+        else
+            -- CD is ready: allow alert to fire when healer falls below 50%
+            if mPct and mPct < 50 then
+                if not INN_ALERT_SHOWN[myName] then
+                    INN_ALERT_SHOWN[myName] = true
+                    INN_ShowAlert(assignedH, mPct)
+                end
+            elseif mPct and mPct >= 60 then
+                -- Healer recovered above 60%: reset flag so next drop triggers again
+                INN_ALERT_SHOWN[myName] = nil
             end
-        elseif mPct and mPct >= 60 then
-            -- Reset so alert can fire again next time mana drops
-            INN_ALERT_SHOWN[myName] = nil
         end
     end
     -- Update innervate assignment window if open
