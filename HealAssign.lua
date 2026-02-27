@@ -6,7 +6,7 @@
 -- CONSTANTS
 -------------------------------------------------------------------------------
 local ADDON_NAME    = "HealAssign"
-local ADDON_VERSION = "2.0.2"
+local ADDON_VERSION = "2.0.3"
 local COMM_PREFIX   = "HealAssign"
 
 local CLASS_COLORS = {
@@ -297,6 +297,9 @@ local optionsFrame = nil
 local rlFrame      = nil
 local alertFrame   = nil
 local innervateFrame = nil
+
+-- Forward declarations for functions used before their definition
+local INN_BroadcastCast  -- defined in INNERVATE ASSIGNMENT SYSTEM section
 
 -- Innervate forward refs (functions defined later)
 local innCD           = {}    -- [druidName] = GetTime() of cast
@@ -876,22 +879,27 @@ local function UpdateAssignFrame()
                 if tmpl.roster and tmpl.roster[pair.healer] then
                     vhr,vhg,vhb = GetClassColor(tmpl.roster[pair.healer].class)
                 end
-                -- Simple text row: DruidName -> HealerName (no icon per row)
+                -- FIX 2: single row, druid LEFT half, healer RIGHT half, no arrow separator
                 local vRow = CreateFrame("Frame",nil,assignFrame)
                 vRow:SetPoint("TOPLEFT",assignFrame,"TOPLEFT",6,yOff)
                 vRow:SetWidth(assignFrame:GetWidth()-12)
                 vRow:SetHeight(rowH)
                 table.insert(assignFrame.content,vRow)
-                -- Two FontStrings: druid LEFT, healer RIGHT (no SetWidth = no clipping)
+                local rowW = assignFrame:GetWidth()-12
+                local halfW = math.floor(rowW/2) - 4
+                -- Druid name occupies left half
                 local vFS = vRow:CreateFontString(nil,"OVERLAY")
                 vFS:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
                 vFS:SetPoint("LEFT",vRow,"LEFT",6,0)
+                vFS:SetWidth(halfW)
                 vFS:SetJustifyH("LEFT")
                 vFS:SetTextColor(vdr,vdg,vdb)
-                vFS:SetText(pair.druid.." ->")
+                vFS:SetText(pair.druid)
+                -- Healer name occupies right half
                 local vHFS = vRow:CreateFontString(nil,"OVERLAY")
                 vHFS:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
                 vHFS:SetPoint("RIGHT",vRow,"RIGHT",-4,0)
+                vHFS:SetWidth(halfW)
                 vHFS:SetJustifyH("RIGHT")
                 vHFS:SetTextColor(vhr,vhg,vhb)
                 vHFS:SetText(pair.healer)
@@ -1137,19 +1145,25 @@ local function UpdateDruidAssignFrame()
         return
     end
 
+    -- Layout constants (all scale with fontSize)
     local fontSize = (HealAssignDB and HealAssignDB.options and HealAssignDB.options.fontSize) or 12
-    local frameW = 130 + (fontSize-8)*7
-    if frameW < 120 then frameW = 120 end
-    if frameW > 240 then frameW = 240 end
+    local PAD     = 8
+    local titleH  = fontSize + 10    -- title row height
+    local rowStep = fontSize + 8     -- mana row height
+    local ICON_SZ = math.floor(fontSize * 2.5)
+    if ICON_SZ < 20 then ICON_SZ = 20 end
+    if ICON_SZ > 48 then ICON_SZ = 48 end
+    local BTN_H   = fontSize + 10
+    local cdFontSz = math.floor(fontSize * 0.85)
+    if cdFontSz < 8 then cdFontSz = 8 end
 
-    local ICON_SZ = math.floor(fontSize * 2.2)
-    if ICON_SZ < 18 then ICON_SZ = 18 end
-    if ICON_SZ > 44 then ICON_SZ = 44 end
-    local BTN_H  = fontSize + 10
-    local PAD    = 8
-    local titleH = fontSize + 10
-    local rowH   = fontSize + 4
-    local rowStep= fontSize + 6
+    -- Frame width scales with fontSize
+    local frameW = 100 + fontSize * 8
+    if frameW < 120 then frameW = 120 end
+    if frameW > 260 then frameW = 260 end
+
+    -- Total height: PAD + title + PAD/2 + mana + PAD + icon + PAD + button + PAD
+    local totalH = PAD + titleH + 4 + rowStep + PAD + ICON_SZ + PAD + BTN_H + PAD
 
     -- Create frame once
     if not druidAssignFrame then
@@ -1158,7 +1172,15 @@ local function UpdateDruidAssignFrame()
         druidAssignFrame:EnableMouse(true)
         druidAssignFrame:RegisterForDrag("LeftButton")
         druidAssignFrame:SetScript("OnDragStart",function() this:StartMoving() end)
-        druidAssignFrame:SetScript("OnDragStop",function() this:StopMovingOrSizing() end)
+        druidAssignFrame:SetScript("OnDragStop",function()
+            this:StopMovingOrSizing()
+            -- FIX 2: save position so it restores on next show
+            local _,_,_,x,y = this:GetPoint()
+            if HealAssignDB and HealAssignDB.options then
+                HealAssignDB.options.druidFrameX = x
+                HealAssignDB.options.druidFrameY = y
+            end
+        end)
         druidAssignFrame:SetFrameStrata("MEDIUM")
         druidAssignFrame:SetBackdrop({
             bgFile="Interface\\DialogFrame\\UI-DialogBox-Background",
@@ -1166,9 +1188,12 @@ local function UpdateDruidAssignFrame()
             tile=true,tileSize=8,edgeSize=12,
             insets={left=4,right=4,top=4,bottom=4}
         })
-        druidAssignFrame:SetPoint("TOPLEFT",UIParent,"TOPLEFT",20,-200)
+        -- FIX 2: restore saved position or use default
+        local _dx = HealAssignDB and HealAssignDB.options and HealAssignDB.options.druidFrameX or 20
+        local _dy = HealAssignDB and HealAssignDB.options and HealAssignDB.options.druidFrameY or -200
+        druidAssignFrame:SetPoint("TOPLEFT",UIParent,"TOPLEFT",_dx,_dy)
 
-        -- Permanent widgets created once
+        -- Options button (top-right corner, fixed size)
         local optBtn = CreateFrame("Button",nil,druidAssignFrame,"UIPanelButtonTemplate")
         optBtn:SetWidth(24) optBtn:SetHeight(16)
         optBtn:SetPoint("TOPRIGHT",druidAssignFrame,"TOPRIGHT",-4,-4)
@@ -1178,25 +1203,29 @@ local function UpdateDruidAssignFrame()
             else HealAssign_OpenOptions() end
         end)
 
+        -- Title fontstring (healer name)
         local tFS = druidAssignFrame:CreateFontString(nil,"OVERLAY")
-        tFS:SetPoint("TOP",druidAssignFrame,"TOP",0,-PAD)
+        tFS:SetJustifyH("CENTER")
         druidAssignFrame._titleFS = tFS
 
+        -- Mana fontstring
         local mFS = druidAssignFrame:CreateFontString(nil,"OVERLAY")
         mFS:SetJustifyH("CENTER")
         druidAssignFrame._manaFS = mFS
 
+        -- Icon frame + texture + CD label
         local iFrame = CreateFrame("Frame",nil,druidAssignFrame)
         local iTex = iFrame:CreateTexture(nil,"BACKGROUND")
         iTex:SetTexture(INN_ICON)
-        local iCDFS = iFrame:CreateFontString(nil,"OVERLAY")
-        iCDFS:SetFont("Fonts\\FRIZQT__.TTF",11,"OUTLINE")
+        iTex:SetAllPoints(iFrame)          -- FIX: texture fills iFrame
+        local iCDFS = iFrame:CreateFontString(nil,"OVERLAY","GameFontNormal")
         iCDFS:SetPoint("CENTER",iFrame,"CENTER",0,0)
-        iCDFS:SetTextColor(1,1,1)
+        iCDFS:SetTextColor(1,1,0)
         druidAssignFrame._iconFrame = iFrame
         druidAssignFrame._iconTex   = iTex
         druidAssignFrame._iconCDFS  = iCDFS
 
+        -- Cast button
         local btn = CreateFrame("Button",nil,druidAssignFrame,"UIPanelButtonTemplate")
         btn:SetText("Innervate!")
         btn:SetScript("OnClick",function()
@@ -1217,9 +1246,11 @@ local function UpdateDruidAssignFrame()
     druidAssignFrame:SetBackdropBorderColor(0.3,0.6,1,0.8)
 
     -- Resize frame
-    local totalH = titleH + rowStep + ICON_SZ + PAD + BTN_H + PAD*2
     druidAssignFrame:SetWidth(frameW)
     druidAssignFrame:SetHeight(totalH)
+
+    -- Running Y cursor from top
+    local curY = -PAD
 
     -- Title: healer name
     local hr,hg,hb = 1,1,1
@@ -1227,15 +1258,19 @@ local function UpdateDruidAssignFrame()
         hr,hg,hb = GetClassColor(tmpl.roster[assignedHealer].class)
     end
     local tFS = druidAssignFrame._titleFS
-    tFS:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
+    tFS:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"OUTLINE")
     tFS:SetTextColor(hr,hg,hb)
     tFS:SetText(assignedHealer)
+    tFS:ClearAllPoints()
+    tFS:SetPoint("TOP",druidAssignFrame,"TOP",0,curY)
+    tFS:SetWidth(frameW - 32)   -- leave room for O button
+    curY = curY - titleH - 4
 
     -- Mana
     local mFS = druidAssignFrame._manaFS
     mFS:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
     mFS:ClearAllPoints()
-    mFS:SetPoint("TOP",druidAssignFrame,"TOP",0,-(titleH + rowStep/2))
+    mFS:SetPoint("TOP",druidAssignFrame,"TOP",0,curY)
     mFS:SetWidth(frameW - 12)
     local manaPct = INN_GetHealerMana(assignedHealer)
     if manaPct then
@@ -1247,16 +1282,14 @@ local function UpdateDruidAssignFrame()
         mFS:SetTextColor(0.5,0.5,0.5)
         mFS:SetText("Mana: ?")
     end
+    curY = curY - rowStep - PAD
 
-    -- Icon
-    local iconY = -(titleH + rowStep + 2)
+    -- Icon (centered horizontally)
     local iFrame = druidAssignFrame._iconFrame
     iFrame:ClearAllPoints()
-    iFrame:SetPoint("TOPLEFT",druidAssignFrame,"TOPLEFT",(frameW-ICON_SZ)/2, iconY)
+    iFrame:SetPoint("TOP",druidAssignFrame,"TOP",0,curY)
     iFrame:SetWidth(ICON_SZ)
     iFrame:SetHeight(ICON_SZ)
-    local iTex = druidAssignFrame._iconTex
-    -- Texture stays attached to iFrame via SetAllPoints set at creation
 
     -- CD via GetSpellCooldown (own spell - no combat log needed)
     local cdStart,cdDur = GetSpellCooldown("Innervate")
@@ -1265,9 +1298,11 @@ local function UpdateDruidAssignFrame()
         cdRem = (cdStart + cdDur) - GetTime()
         if cdRem < 0 then cdRem = 0 end
     end
+    local iTex  = druidAssignFrame._iconTex
     local iCDFS = druidAssignFrame._iconCDFS
+    iCDFS:SetFont("Fonts\\FRIZQT__.TTF",cdFontSz,"OUTLINE")
     if cdRem > 0 then
-        iTex:SetVertexColor(0.35,0.35,0.35)
+        iTex:SetVertexColor(0.3,0.3,0.3)
         local mins = math.floor(cdRem/60)
         local secs = math.floor(math.mod(cdRem,60))
         iCDFS:SetText(string.format("%d:%02d",mins,secs))
@@ -1275,13 +1310,13 @@ local function UpdateDruidAssignFrame()
         iTex:SetVertexColor(1,1,1)
         iCDFS:SetText("")
     end
+    curY = curY - ICON_SZ - PAD
 
-    -- Cast button
-    local btnY = iconY - ICON_SZ - PAD
+    -- Cast button (full width minus padding)
     local btn = druidAssignFrame._castBtn
     btn:ClearAllPoints()
-    btn:SetPoint("TOPLEFT",druidAssignFrame,"TOPLEFT",PAD,btnY)
-    btn:SetPoint("TOPRIGHT",druidAssignFrame,"TOPRIGHT",-PAD,btnY)
+    btn:SetPoint("TOP",druidAssignFrame,"TOP",0,curY)
+    btn:SetWidth(frameW - PAD*2)
     btn:SetHeight(BTN_H)
     if cdRem > 0 then
         btn:SetTextColor(0.5,0.5,0.5)
@@ -1311,29 +1346,107 @@ local function UpdateRLFrame()
     local deadSet = {}
     for _,d in ipairs(deadHealers) do deadSet[d.name] = true end
 
+    -- FIX 6: reorganize display - group by target (tanks first, then groups)
+    -- Build ordered list of unique targets: tanks sorted by name, then groups sorted by number
+    local tankTargets  = {}   -- {key, display, ttype, tvalue}
+    local groupTargets = {}
+    local targetSeen   = {}
+    for _,h in ipairs(tmpl.healers) do
+        for _,t in ipairs(h.targets or {}) do
+            local key = (t.type or "").."~"..(t.value or "")
+            if not targetSeen[key] then
+                targetSeen[key] = true
+                local entry = {key=key, display=GetTargetDisplayText(t), ttype=t.type, tvalue=t.value}
+                if t.type == TYPE_TANK then
+                    table.insert(tankTargets, entry)
+                elseif t.type == TYPE_GROUP then
+                    table.insert(groupTargets, entry)
+                end
+            end
+        end
+    end
+    table.sort(tankTargets,  function(a,b) return a.tvalue < b.tvalue end)
+    table.sort(groupTargets, function(a,b) return tonumber(a.tvalue) < tonumber(b.tvalue) end)
+
     local yOff = -30
-    local function AddRLRow(text,r,g,b)
+    local function AddRLRow(text,indent,r,g,b)
         local fs = rlFrame:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
-        fs:SetPoint("TOPLEFT",rlFrame,"TOPLEFT",10,yOff)
+        fs:SetPoint("TOPLEFT",rlFrame,"TOPLEFT",10 + (indent or 0)*14,yOff)
         fs:SetTextColor(r or 1,g or 1,b or 1)
         fs:SetText(text)
-        yOff = yOff-16
-        table.insert(rlFrame.content,fs)
+        yOff = yOff - 16
+        table.insert(rlFrame.content, fs)
     end
 
-    for _,h in ipairs(tmpl.healers) do
-        if deadSet[h.name] then
-            AddRLRow(h.name.."  [DEAD]",1,0.2,0.2)
-        else
-            AddRLRow(h.name.."  [alive]",0.2,1,0.2)
+    -- Helper: find all healers assigned to a given target key
+    local function HealersForTarget(targetKey)
+        local out = {}
+        for _,h in ipairs(tmpl.healers) do
+            for _,t in ipairs(h.targets or {}) do
+                local k = (t.type or "").."~"..(t.value or "")
+                if k == targetKey then
+                    table.insert(out, h.name)
+                    break
+                end
+            end
         end
-        for _,t in ipairs(h.targets) do
-            AddRLRow("    "..GetTargetDisplayText(t),0.75,0.75,0.75)
+        table.sort(out)
+        return out
+    end
+
+    -- Render tanks section
+    if table.getn(tankTargets) > 0 then
+        for _,tgt in ipairs(tankTargets) do
+            -- Tank header row: class color from roster if available
+            local tr,tg,tb = 0.78,0.61,0.43   -- warrior gold as default tank color
+            if tmpl.roster and tmpl.roster[tgt.tvalue] then
+                tr,tg,tb = GetClassColor(tmpl.roster[tgt.tvalue].class)
+            end
+            AddRLRow(tgt.display, 0, tr,tg,tb)
+            for _,hname in ipairs(HealersForTarget(tgt.key)) do
+                local hr2,hg2,hb2 = 1,1,1
+                if tmpl.roster and tmpl.roster[hname] then
+                    hr2,hg2,hb2 = GetClassColor(tmpl.roster[hname].class)
+                end
+                local suffix = deadSet[hname] and "  [DEAD]" or ""
+                local dr2,dg2,db2 = deadSet[hname] and 1 or hr2, deadSet[hname] and 0.2 or hg2, deadSet[hname] and 0.2 or hb2
+                AddRLRow(hname..suffix, 1, dr2,dg2,db2)
+            end
         end
     end
 
-    local totalH = math.abs(yOff) + rowStep
-    if totalH < titleH + rowStep * 2 then totalH = titleH + rowStep * 2 end
+    -- Render groups section
+    if table.getn(groupTargets) > 0 then
+        for _,tgt in ipairs(groupTargets) do
+            AddRLRow(tgt.display, 0, 0.5,0.85,1.0)
+            for _,hname in ipairs(HealersForTarget(tgt.key)) do
+                local hr2,hg2,hb2 = 1,1,1
+                if tmpl.roster and tmpl.roster[hname] then
+                    hr2,hg2,hb2 = GetClassColor(tmpl.roster[hname].class)
+                end
+                local suffix = deadSet[hname] and "  [DEAD]" or ""
+                local dr2,dg2,db2 = deadSet[hname] and 1 or hr2, deadSet[hname] and 0.2 or hg2, deadSet[hname] and 0.2 or hb2
+                AddRLRow(hname..suffix, 1, dr2,dg2,db2)
+            end
+        end
+    end
+
+    -- Fallback: if no tank/group targets, show plain healer list
+    if table.getn(tankTargets) == 0 and table.getn(groupTargets) == 0 then
+        for _,h in ipairs(tmpl.healers) do
+            local hr2,hg2,hb2 = 1,1,1
+            if tmpl.roster and tmpl.roster[h.name] then
+                hr2,hg2,hb2 = GetClassColor(tmpl.roster[h.name].class)
+            end
+            local suffix = deadSet[h.name] and "  [DEAD]" or ""
+            AddRLRow(h.name..suffix, 0, hr2,hg2,hb2)
+        end
+    end
+
+    -- Resize frame to content
+    local totalH = math.abs(yOff) + 20
+    if totalH < 80 then totalH = 80 end
+    rlFrame:SetWidth(220)
     rlFrame:SetHeight(totalH)
     rlFrame:Show()
 end
@@ -2279,10 +2392,21 @@ local function CreateMainFrame()
         else CreateRosterFrame() end
     end)
 
+    -- FIX 4: button order: Roster -> Innervate -> Sync -> Options
+    local innBtn = CreateFrame("Button",nil,mainFrame,"UIPanelButtonTemplate")
+    innBtn:SetWidth(64)
+    innBtn:SetHeight(20)
+    innBtn:SetPoint("LEFT",rosterBtn,"RIGHT",2,0)
+    innBtn:SetText("Innervate")
+    innBtn:SetScript("OnClick",function()
+        if innervateFrame and innervateFrame:IsShown() then innervateFrame:Hide()
+        else CreateInnervateFrame() end
+    end)
+
     local syncBtn = CreateFrame("Button",nil,mainFrame,"UIPanelButtonTemplate")
     syncBtn:SetWidth(46)
     syncBtn:SetHeight(20)
-    syncBtn:SetPoint("LEFT",rosterBtn,"RIGHT",2,0)
+    syncBtn:SetPoint("LEFT",innBtn,"RIGHT",2,0)
     syncBtn:SetText("Sync")
     syncBtn:SetScript("OnClick",function() HealAssign_SyncTemplate() end)
 
@@ -2296,20 +2420,10 @@ local function CreateMainFrame()
         else CreateOptionsFrame() end
     end)
 
-    -- Tooltips row 2
-    local innBtn = CreateFrame("Button",nil,mainFrame,"UIPanelButtonTemplate")
-    innBtn:SetWidth(64)
-    innBtn:SetHeight(20)
-    innBtn:SetPoint("LEFT",optBtn,"RIGHT",2,0)
-    innBtn:SetText("Innervate")
-    innBtn:SetScript("OnClick",function()
-        if innervateFrame and innervateFrame:IsShown() then innervateFrame:Hide()
-        else CreateInnervateFrame() end
-    end)
     AddTooltip(rosterBtn, "Open Raid Roster to tag tanks, healers and viewers.")
+    AddTooltip(innBtn,    "Manage Innervate assignments for druids.")
     AddTooltip(syncBtn,   "Broadcast current template to all raid members with the addon.")
     AddTooltip(optBtn,    "Open addon options: font size, opacity, assign frame settings.")
-    AddTooltip(innBtn,    "Manage Innervate assignments for druids.")
 
     RebuildMainGrid()
     PushWindow(mainFrame)
@@ -2681,6 +2795,8 @@ eventFrame:SetScript("OnEvent",function()
                 else
                     assignFrame:Hide()
                 end
+                -- FIX 4: always hide druid frame when leaving raid
+                if druidAssignFrame then druidAssignFrame:Hide() end
             end
         end
         if inRaid then
@@ -2691,6 +2807,12 @@ eventFrame:SetScript("OnEvent",function()
             -- Left raid: close roster (stale data), keep main frame open
             if rosterFrame and rosterFrame:IsShown() then rosterFrame:Hide() end
             if rlFrame and rlFrame:IsShown() then rlFrame:Hide() end
+            -- FIX 5: clear runtime roster so stale members don't appear in new raid
+            if currentTemplate then
+                currentTemplate.roster    = {}
+                currentTemplate.healers   = {}
+                currentTemplate.innervate = {}
+            end
         end
     end
 end)
@@ -2738,18 +2860,17 @@ end
 local function INN_BroadcastAssignments()
     local tmpl = GetActiveTemplate()
     if not tmpl or not tmpl.innervate then return end
+    local chan = INN_GetChannel()
+    if not chan then return end   -- FIX 1b: not in group, skip (prevents "Unknown addon chat type")
     local parts = {}
     for d,h in pairs(tmpl.innervate) do
         table.insert(parts, d.."="..h)
     end
-    local chan = INN_GetChannel()
-    if chan then
-        pcall(SendAddonMessage, COMM_PREFIX, "INN_ASSIGN;"..table.concat(parts,"|"), chan)
-    end
+    pcall(SendAddonMessage, COMM_PREFIX, "INN_ASSIGN;"..table.concat(parts,"|"), chan)
 end
 
 -- Called after druid casts - broadcast cast time
-local function INN_BroadcastCast(druidName)
+INN_BroadcastCast = function(druidName)
     local chan = INN_GetChannel()
     if chan then
         pcall(SendAddonMessage, COMM_PREFIX, "INN_CAST;"..druidName, chan)
@@ -2878,20 +2999,12 @@ local function INN_RebuildAssignRows()
             hLabel:SetText("---")
         end
 
-        -- Dropdown button (small, right side of cell)
-        local ddBtn = CreateFrame("Button",nil,cell2)
+        -- FIX 3: standard addon button style (UIPanelButtonTemplate like all other buttons)
+        local ddBtn = CreateFrame("Button",nil,cell2,"UIPanelButtonTemplate")
         ddBtn:SetWidth(50)
         ddBtn:SetHeight(16)
         ddBtn:SetPoint("RIGHT",cell2,"RIGHT",-4,0)
-        ddBtn:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight","ADD")
-        local ddTex = ddBtn:CreateTexture(nil,"BACKGROUND")
-        ddTex:SetAllPoints(ddBtn)
-        ddTex:SetTexture(0.15,0.15,0.3,0.8)
-        local ddLabel = ddBtn:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
-        ddLabel:SetAllPoints(ddBtn)
-        ddLabel:SetJustifyH("CENTER")
-        ddLabel:SetTextColor(0.8,0.8,1)
-        ddLabel:SetText("Assign")
+        ddBtn:SetText("Assign")
         local capturedDruid = dname
         ddBtn:SetScript("OnClick",function()
             local items = {}
@@ -3019,9 +3132,24 @@ innTicker:SetScript("OnUpdate",function()
         end
     end
 
-    -- Update druid innervate frame
-    if isDruid2 and tmpl.innervate and tmpl.innervate[myName] then
+    -- Update druid assign frame every tick (mana refresh + CD timer).
+    local myPdata3 = tmpl.roster and tmpl.roster[myName]
+    local amDruid = myPdata3 and myPdata3.class == "DRUID" and not myPdata3.tagH
+    if amDruid and tmpl.innervate and tmpl.innervate[myName] then
         UpdateDruidAssignFrame()
+        -- FIX 3: BigWigs-style green alert when assigned healer drops below 50% mana
+        local assignedH = tmpl.innervate[myName]
+        local mPct = INN_GetHealerMana(assignedH)
+        if mPct and mPct < 50 then
+            -- Only fire once per low-mana event; reset when mana recovers above 60%
+            if not INN_ALERT_SHOWN[myName] then
+                INN_ALERT_SHOWN[myName] = true
+                INN_ShowAlert(assignedH, mPct)
+            end
+        elseif mPct and mPct >= 60 then
+            -- Reset so alert can fire again next time mana drops
+            INN_ALERT_SHOWN[myName] = nil
+        end
     end
     -- Update innervate assignment window if open
     if innervateFrame and innervateFrame:IsShown() then

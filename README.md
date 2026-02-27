@@ -1,4 +1,4 @@
-# HealAssign v2.0.2
+# HealAssign v2.0.3
 
 A healer assignment addon for **World of Warcraft 1.12.1 (Vanilla / Turtle WoW)**.
 
@@ -88,6 +88,20 @@ Designed for raid leaders and healers to manage and display healing assignments 
 ---
 
 ## Changelog
+
+### v2.0.3
+- **Innervate assignment system** — raid leader assigns each non-healer druid to a specific healer
+- Druids receive a dedicated assignment window showing their assigned healer's name and current mana %
+- Innervate cooldown timer shown on the icon in the druid window (reads from `GetSpellCooldown`)
+- **Mana alert** — when assigned healer drops below 50% mana, druid receives a BigWigs-style green on-screen alert; resets when mana recovers above 60%
+- Innervate cooldown also shown in the healer's own assignment window
+- **Roster cleared on raid leave** — stale members from previous raid no longer appear in new raid
+- Fixed: assignment window now hides automatically when leaving raid
+- Fixed: druid assignment window restores last position after reload
+- Fixed: `INN_BroadcastCast` forward declaration (nil error on healer side)
+- Fixed: `Unknown addon chat type` error when assigning Innervate outside of a group
+- Button order in main window: Raid Roster → Innervate → Sync → Options
+- Assign button in Innervate window now uses standard `UIPanelButtonTemplate`
 
 ### v2.0.0
 - Full rewrite: healer-centric layout (one column per healer)
