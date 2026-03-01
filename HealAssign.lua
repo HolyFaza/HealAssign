@@ -6,7 +6,7 @@
 -- CONSTANTS
 -------------------------------------------------------------------------------
 local ADDON_NAME    = "HealAssign"
-local ADDON_VERSION = "2.0.2"
+local ADDON_VERSION = "2.0.3"
 local COMM_PREFIX   = "HealAssign"
 
 local CLASS_COLORS = {
@@ -3477,4 +3477,5 @@ SlashCmdList["HEALASSIGN"] = function(msg)
             CreateMainFrame()
         end
     end
+
 end
