@@ -1,4 +1,4 @@
-# HealAssign v2.0.3
+# HealAssign v2.0.4
 
 A healer assignment addon for **World of Warcraft 1.12.1 (Vanilla / Turtle WoW)**.
 
@@ -41,10 +41,16 @@ Designed for raid leaders and healers to manage and display healing assignments 
 - Dead healers shown in **red**
 - Receives death alerts and audio notification
 
+### Battle Rez (Druid)
+- Raid leader assigns each druid a **Battle Rez target** (any raid member)
+- Druids receive a dedicated window showing their assigned target
+- Battle Rez cooldown timer displayed on the icon
+
 ### Options
 - Font size for the assignment window (8–24)
 - Window opacity
 - Show assignment window outside raid
+- Hide addon in Battlegrounds (enabled by default)
 - Custom assignment targets (e.g. "Main Tank", "OT", "Skull")
 
 ---
@@ -55,7 +61,7 @@ Designed for raid leaders and healers to manage and display healing assignments 
    ```
    World of Warcraft/Interface/AddOns/HealAssign/
    ```
-2. The folder must contain `HealAssign.lua` and `HealAssign.toc`
+2. The folder must contain `HealAssign.lua`, `HealAssign.xml` and `HealAssign.toc`
 3. Enable the addon in the AddOns menu on the character select screen
 
 ---
@@ -88,6 +94,11 @@ Designed for raid leaders and healers to manage and display healing assignments 
 ---
 
 ## Changelog
+
+### v2.0.4
+- **Battle Rez assignment system** — raid leader assigns each druid a Battle Rez target; druids receive a dedicated window with their assigned target and cooldown timer
+- **Minimap icon** — addon now shows a draggable icon on the minimap; click to toggle the main window; drag to reposition
+- **Hide in Battlegrounds** — new checkbox in Options; when enabled (default), the addon is hidden in battlegrounds
 
 ### v2.0.3
 - **Innervate assignment system** — raid leader assigns each non-healer druid to a specific healer

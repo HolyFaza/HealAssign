@@ -6,7 +6,7 @@
 -- CONSTANTS
 -------------------------------------------------------------------------------
 local ADDON_NAME    = "HealAssign"
-local ADDON_VERSION = "2.0.2"
+local ADDON_VERSION = "2.0.4"
 local COMM_PREFIX   = "HealAssign"
 
 local CLASS_COLORS = {
@@ -61,6 +61,7 @@ local function InitDB()
         HealAssignDB.options = {
             fontSize        = 12,
             showAssignFrame = false,
+            hideInBG        = true,
             windowAlpha     = 0.95,
             customTargets   = {},
         }
@@ -68,6 +69,7 @@ local function InitDB()
     if not HealAssignDB.options.customTargets  then HealAssignDB.options.customTargets = {} end
     if not HealAssignDB.options.fontSize       then HealAssignDB.options.fontSize = 12 end
     if HealAssignDB.options.showAssignFrame == nil then HealAssignDB.options.showAssignFrame = false end
+    if HealAssignDB.options.hideInBG == nil then HealAssignDB.options.hideInBG = true end
     if HealAssignDB.options.windowAlpha == nil then HealAssignDB.options.windowAlpha = 0.95 end
     if not HealAssignDB.innCD then HealAssignDB.innCD = {} end
 end
@@ -119,6 +121,7 @@ local _nameEditRef = nil
 -- Forward-declared references set after the real functions are defined
 local _RebuildMainGrid       = nil
 local _UpdateAssignFrame     = nil
+local _CreateMainFrame       = nil
 local _SyncHealersFromRoster = nil
 local _RebuildRosterRows     = nil
 
@@ -178,7 +181,7 @@ local function InitStaticPopups()
             currentTemplate.name = name
             HealAssignDB.templates[name] = DeepCopy(currentTemplate)
             HealAssignDB.activeTemplate = name
-            DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Saved '"..name.."'.")
+                    DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Saved '"..name.."'.")
             _DoNewTemplate()
         end,
         timeout = 0, whileDead = true, hideOnEscape = true,
@@ -253,7 +256,17 @@ end
 -------------------------------------------------------------------------------
 -- TEMPLATE STATE
 -------------------------------------------------------------------------------
-currentTemplate = nil
+currentTemplate  = nil
+HA_wasInRaid     = false  -- true only after first RAID_ROSTER_UPDATE(inRaid=true) this session
+HA_reloadProtect = true   -- true on fresh load, blocks roster clear until raid confirmed
+
+-- Ensure currentTemplate is always persisted in HealAssignDB
+local function PersistTemplate()
+    if currentTemplate and currentTemplate.name and currentTemplate.name ~= "" then
+        HealAssignDB.templates[currentTemplate.name] = DeepCopy(currentTemplate)
+        HealAssignDB.activeTemplate = currentTemplate.name
+    end
+end
 
 local function GetActiveTemplate()
     if currentTemplate then
@@ -286,26 +299,8 @@ local function SyncHealersFromRoster(tmpl)
     if not tmpl.innervate then tmpl.innervate = {} end
 end
 
--------------------------------------------------------------------------------
--- FRAME REFERENCES
--------------------------------------------------------------------------------
-local mainFrame    = nil
-local rosterFrame  = nil
-local assignFrame      = nil
-local druidAssignFrame = nil
-local optionsFrame = nil
-local rlFrame      = nil
-local alertFrame   = nil
-local innervateFrame = nil
-
--- Forward declarations for functions used before their definition
-local INN_BroadcastCast  -- defined in INNERVATE ASSIGNMENT SYSTEM section
-
--- Innervate forward refs (functions defined later)
-local innCD           = {}    -- [druidName] = GetTime() of cast
-local INN_CD_FULL     = 360
-local INN_ICON        = "Interface\\Icons\\Spell_Nature_Lightning"
-local INN_ALERT_SHOWN = {}
+local innCD           = {}    -- [druidName] = GetTime() when cast
+local INN_ALERT_SHOWN = {}    -- [druidName] = true when alert shown
 
 local function INN_GetCDRemaining(druidName)
     local t = innCD[druidName]
@@ -348,6 +343,102 @@ local function INN_RestoreFromDB()
             innCD[druidName] = GetTime() - (INN_CD_FULL - data.rem)
         end
     end
+end
+
+-------------------------------------------------------------------------------
+-- BATTLEGROUND DETECTION
+-------------------------------------------------------------------------------
+local function HA_IsInBattleground()
+    local zone = GetZoneText() or ""
+    -- WoW 1.12 battleground zone names
+    local bgZones = {
+        ["Warsong Gulch"]      = true,
+        ["Arathi Basin"]       = true,
+        ["Alterac Valley"]     = true,
+    }
+    return bgZones[zone] == true
+end
+
+-- Returns true if addon windows should be visible right now
+local function HA_ShouldShow()
+    if HA_IsInBattleground() then
+        local hideInBG = HealAssignDB and HealAssignDB.options and HealAssignDB.options.hideInBG
+        if hideInBG == nil then hideInBG = true end
+        if hideInBG then return false end
+    end
+    return true
+end
+
+-------------------------------------------------------------------------------
+-- INNERVATE RUNTIME STATE
+-------------------------------------------------------------------------------
+local INN_CD_FULL   = 1200  -- 20 min innervate CD
+local INN_ICON      = "Interface\\Icons\\Spell_Nature_Lightning"
+local innervateFrame = nil  -- assignment popup frame
+
+-------------------------------------------------------------------------------
+-- REBIRTH SYSTEM UTILITIES
+-------------------------------------------------------------------------------
+local BR_CD_FULL    = 1800  -- 30 min in vanilla
+local BR_ICON       = "Interface\\Icons\\Spell_Nature_Reincarnation"
+local brDeadList    = {}    -- [{name, time}] мёртвые T/H для BR
+local brTargeted    = {}    -- [druidName] = targetName
+local brCD          = {}    -- [druidName] = castTime
+
+local function BR_IsTH(name)
+    local tmpl = GetActiveTemplate()
+    if not tmpl or not tmpl.roster then return false end
+    local pd = tmpl.roster[name]
+    return pd and (pd.tagT or pd.tagH)
+end
+
+local function BR_GetCDRemaining(druidName)
+    -- Own CD: read directly from spell
+    if druidName == UnitName("player") then
+        local cdStart, cdDur = GetSpellCooldown("Rebirth")
+        if cdStart and cdStart > 0 and cdDur and cdDur > 1.5 then
+            local rem = (cdStart + cdDur) - GetTime()
+            return rem > 0 and rem or 0
+        end
+        return 0
+    end
+    -- Others: from brCD table (set via combat log)
+    local t = brCD[druidName]
+    if not t then return 0 end
+    local rem = BR_CD_FULL - (GetTime() - t)
+    return rem > 0 and rem or 0
+end
+
+local function BR_AddDead(name)
+    for _,d in ipairs(brDeadList) do
+        if d.name == name then return end  -- already in list
+    end
+    table.insert(brDeadList, {name=name, time=GetTime()})
+end
+
+local function BR_RemoveDead(name)
+    local new = {}
+    for _,d in ipairs(brDeadList) do
+        if d.name ~= name then table.insert(new, d) end
+    end
+    brDeadList = new
+    -- Clear targeting if someone was targeting this person
+    for druid, target in pairs(brTargeted) do
+        if target == name then brTargeted[druid] = nil end
+    end
+end
+
+local function BR_BroadcastTarget(druidName, targetName)
+    local chan = GetNumRaidMembers() > 0 and "RAID" or nil
+    if not chan then return end
+    local msg = targetName and ("BR_TARGET;"..druidName..";"..targetName) or ("BR_CLEAR;"..druidName)
+    pcall(SendAddonMessage, COMM_PREFIX, msg, chan)
+end
+
+local function BR_BroadcastCast(druidName)
+    local chan = GetNumRaidMembers() > 0 and "RAID" or nil
+    if not chan then return end
+    pcall(SendAddonMessage, COMM_PREFIX, "BR_CAST;"..druidName, chan)
 end
 
 -------------------------------------------------------------------------------
@@ -589,6 +680,8 @@ end
 -------------------------------------------------------------------------------
 local deadHealers = {}
 
+-- Rebirth system
+
 -- DBM-style alert: big text center screen, fades after 5 sec
 local function CreateAlertFrame()
     if alertFrame then return end
@@ -718,10 +811,18 @@ local function UpdateAssignFrame()
         assignFrame:Hide()
         return
     end
+    if not HA_ShouldShow() then
+        assignFrame:Hide()
+        return
+    end
 
     local myName   = UnitName("player")
     local tmpl     = GetActiveTemplate()
     local fontSize = (HealAssignDB.options and HealAssignDB.options.fontSize) or 12
+    local PAD     = 6
+    local ICON_SZ = math.floor(fontSize * 2.5)
+    if ICON_SZ < 20 then ICON_SZ = 20 end
+    if ICON_SZ > 48 then ICON_SZ = 48 end
 
     local myTargets     = {}
     local myDeadTargets = {}
@@ -730,12 +831,11 @@ local function UpdateAssignFrame()
     local myPdata = tmpl and tmpl.roster and tmpl.roster[myName]
     local isHealer = myPdata and myPdata.tagH
     local isViewer = myPdata and myPdata.tagV
-    -- isDruid is used only by druidAssignFrame, not assignFrame
 
     -- assignFrame visibility rules:
     --   H only        -> healer window
     --   V (any combo) -> viewer window (overrides H)
-    --   anything else -> hide (T, T+V handled by isViewer above; druid innervate -> druidAssignFrame)
+    --   anything else -> hide
     if not isHealer and not isViewer then
         assignFrame:Hide()
         return
@@ -996,6 +1096,101 @@ local function UpdateAssignFrame()
             end
         end
 
+        -- ── Rebirth sub-section ───────────────────────────────────────
+        -- Same layout as Innervate: druid left column, target right column
+        do
+            yOff = yOff - 4
+            AddHeader("Rebirth", 0.7,0.3,1, 0.15)
+
+            -- Collect all non-healer druids
+            local brDruids = {}
+            if tmpl.roster then
+                for pname,pd in pairs(tmpl.roster) do
+                    if pd.class == "DRUID" and not pd.tagH then
+                        table.insert(brDruids, pname)
+                    end
+                end
+            end
+            table.sort(brDruids)
+
+            if table.getn(brDruids) == 0 then
+                local noFs = assignFrame:CreateFontString(nil,"OVERLAY")
+                noFs:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
+                noFs:SetPoint("TOPLEFT",assignFrame,"TOPLEFT",PAD+4,yOff)
+                noFs:SetTextColor(0.5,0.5,0.5)
+                noFs:SetText("(no druids)")
+                table.insert(assignFrame.content,noFs)
+                yOff = yOff - rowStep
+            else
+                -- Build druid->target mapping:
+                -- 1. Druids with explicit brTargeted claim keep their target
+                -- 2. Remaining dead auto-assigned to free druids for display
+                local druidTargets = {}
+                local claimedDead  = {}
+                for _,dname in ipairs(brDruids) do
+                    local tgt = brTargeted[dname]
+                    if tgt then
+                        druidTargets[dname] = tgt
+                        claimedDead[tgt] = true
+                    end
+                end
+                -- Auto-assign unclaimed dead to free druids
+                local freeDruids = {}
+                for _,dname in ipairs(brDruids) do
+                    if not druidTargets[dname] then
+                        table.insert(freeDruids, dname)
+                    end
+                end
+                local fdi = 1
+                for _,d in ipairs(brDeadList) do
+                    if not claimedDead[d.name] and fdi <= table.getn(freeDruids) then
+                        druidTargets[freeDruids[fdi]] = d.name
+                        fdi = fdi + 1
+                    end
+                end
+
+                -- One row per druid
+                for _,dname in ipairs(brDruids) do
+                    local tgt    = druidTargets[dname]
+                    local cdRem  = BR_GetCDRemaining(dname)
+                    local dr,dg,db = GetClassColor("DRUID")
+                    local dDisp  = dname
+                    if cdRem > 0 then
+                        local bm = math.floor(cdRem/60)
+                        local bs = math.floor(math.mod(cdRem,60))
+                        dDisp = dname.." |cffffff00("..string.format("%d:%02d",bm,bs)..")|r"
+                    end
+                    local fakeM     = {display=dDisp, ttype="druid", tvalue=dname}
+                    local rightLabel
+                    if tgt then
+                        -- Check if this is claimed (druid clicked) or auto-assigned
+                        if brTargeted[dname] then
+                            rightLabel = tgt  -- claimed: normal color
+                        else
+                            rightLabel = "|cffff4444[!]|r "..tgt  -- auto-assigned: red alert
+                        end
+                    end
+                    local fakeHeals = rightLabel and {rightLabel} or {}
+                    RenderTargetBlock(fakeM, fakeHeals, dr,dg,db)
+                end
+
+                -- Dead with no druid available (more dead than druids)
+                local orphaned = {}
+                for _,d in ipairs(brDeadList) do
+                    local assigned = false
+                    for _,dtgt in pairs(druidTargets) do
+                        if dtgt == d.name then assigned = true break end
+                    end
+                    if not assigned then table.insert(orphaned, d.name) end
+                end
+                for _,uname in ipairs(orphaned) do
+                    local ur,ug,ub = 1,0.2,0.2
+                    local fakeM2 = {display="|cffff4444[!] No druid:|r "..uname, ttype="dead", tvalue=uname}
+                    RenderTargetBlock(fakeM2, {}, ur,ug,ub)
+                end
+            end
+        end
+
         local totalH = math.abs(yOff) + rowStep + 4
         if totalH < titleH + rowStep then totalH = titleH + rowStep end
         assignFrame:SetHeight(totalH)
@@ -1187,6 +1382,173 @@ local function UpdateAssignFrame()
         end
     end
 
+    -- ── BR section for healer-druids ──────────────────────────
+    local myPdH = tmpl and tmpl.roster and tmpl.roster[myName]
+    if myPdH and myPdH.class == "DRUID" and myPdH.tagH then
+        -- Separator
+        if not assignFrame._brSep then
+            local sep = assignFrame:CreateTexture(nil,"ARTWORK")
+            sep:SetHeight(1)
+            sep:SetTexture(0.4,0.4,0.4,0.8)
+            assignFrame._brSep = sep
+        end
+        assignFrame._brSep:ClearAllPoints()
+        assignFrame._brSep:SetPoint("TOPLEFT",assignFrame,"TOPLEFT",6,yOff)
+        assignFrame._brSep:SetPoint("TOPRIGHT",assignFrame,"TOPRIGHT",-6,yOff)
+        assignFrame._brSep:Show()
+        yOff = yOff - 8
+
+        -- BR icon (centered, same size as innervate icon)
+        if not assignFrame._brIconF then
+            local brIF = CreateFrame("Frame",nil,assignFrame)
+            local brIT = brIF:CreateTexture(nil,"BACKGROUND")
+            brIT:SetTexture(BR_ICON)
+            brIT:SetAllPoints(brIF)
+            local brCDT = brIF:CreateFontString(nil,"OVERLAY","GameFontNormal")
+            brCDT:SetPoint("CENTER",brIF,"CENTER",0,0)
+            brCDT:SetTextColor(1,1,0)
+            assignFrame._brIconF   = brIF
+            assignFrame._brIconTex = brIT
+            assignFrame._brCDFS    = brCDT
+        end
+        local brIF = assignFrame._brIconF
+        brIF:ClearAllPoints()
+        brIF:SetPoint("TOP",assignFrame,"TOP",0,yOff)
+        brIF:SetWidth(ICON_SZ) brIF:SetHeight(ICON_SZ)
+        brIF:Show()
+        local brCDRem = BR_GetCDRemaining(myName)
+        local brCDFontSz = math.floor(fontSize * 0.85)
+        if brCDFontSz < 8 then brCDFontSz = 8 end
+        assignFrame._brCDFS:SetFont("Fonts\\FRIZQT__.TTF",brCDFontSz,"OUTLINE")
+        if brCDRem > 0 then
+            assignFrame._brIconTex:SetVertexColor(0.3,0.3,0.3)
+            local bm = math.floor(brCDRem/60)
+            local bs = math.floor(math.mod(brCDRem,60))
+            assignFrame._brCDFS:SetText(string.format("%d:%02d",bm,bs))
+        else
+            assignFrame._brIconTex:SetVertexColor(1,1,1)
+            assignFrame._brCDFS:SetText("")
+        end
+        yOff = yOff - ICON_SZ - 6
+
+        -- Dead list
+        if not assignFrame._brDeadBtns then assignFrame._brDeadBtns = {} end
+        for _,b in ipairs(assignFrame._brDeadBtns) do b:Hide() end
+        assignFrame._brDeadBtns = {}
+        local aRowH   = fontSize + 8
+        local aIconSz = math.floor(fontSize * 1.2)
+        if aIconSz < 10 then aIconSz = 10 end
+        if aIconSz > 20 then aIconSz = 20 end
+        local aInnerW = assignFrame:GetWidth() - PAD_H*2
+        for _,d in ipairs(brDeadList) do
+            local dname = d.name
+            local takenBy = nil
+            for druid,target in pairs(brTargeted) do
+                if target == dname and druid ~= myName then takenBy = druid end
+            end
+            local isMine = brTargeted[myName] == dname
+            local cr,cg,cb = 0.6,0.5,0.5
+            if tmpl and tmpl.roster and tmpl.roster[dname] then
+                cr,cg,cb = GetClassColor(tmpl.roster[dname].class)
+            end
+            local row = CreateFrame("Button",nil,assignFrame)
+            row:SetPoint("TOPLEFT",assignFrame,"TOPLEFT",PAD_H,yOff)
+            row:SetWidth(aInnerW)
+            row:SetHeight(aRowH)
+            row:EnableMouse(not takenBy)
+            row:SetBackdrop({
+                bgFile   = "Interface\\Buttons\\WHITE8X8",
+                edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+                tile=true, tileSize=8, edgeSize=8,
+                insets={left=2,right=2,top=2,bottom=2}
+            })
+            if isMine then
+                row:SetBackdropColor(cr*0.35,cg*0.35,cb*0.35,0.9)
+                row:SetBackdropBorderColor(cr,cg,cb,0.9)
+            elseif takenBy then
+                row:SetBackdropColor(0.1,0.1,0.1,0.6)
+                row:SetBackdropBorderColor(0.3,0.3,0.3,0.4)
+            else
+                row:SetBackdropColor(cr*0.12,cg*0.12,cb*0.12,0.8)
+                row:SetBackdropBorderColor(cr*0.4,cg*0.4,cb*0.4,0.7)
+            end
+            local fs = row:CreateFontString(nil,"OVERLAY")
+            fs:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
+            fs:SetPoint("LEFT",row,"LEFT",6,0)
+            fs:SetPoint("RIGHT",row,"RIGHT",-(aIconSz+8),0)
+            fs:SetHeight(aRowH)
+            fs:SetJustifyH("LEFT") fs:SetJustifyV("MIDDLE")
+            if isMine then fs:SetTextColor(cr,cg,cb)
+            elseif takenBy then
+                fs:SetTextColor(0.4,0.4,0.4)
+                fs:SetText(dname.." |cff666666("..takenBy..")|r")
+            else fs:SetTextColor(0.9,0.85,0.75) end
+            if not takenBy then fs:SetText(dname) end
+            local icF = CreateFrame("Frame",nil,row)
+            icF:SetWidth(aIconSz) icF:SetHeight(aIconSz)
+            icF:SetPoint("RIGHT",row,"RIGHT",-4,0)
+            local icT = icF:CreateTexture(nil,"OVERLAY")
+            icT:SetAllPoints(icF)
+            icT:SetTexture(BR_ICON)
+            if isMine then icT:SetVertexColor(1,0.85,0)     -- yellow: claimed by me
+            elseif takenBy then icT:SetVertexColor(1,0.2,0.2) -- red: claimed by other
+            else icT:SetVertexColor(0.3,1,0.3) end           -- green: free
+            if not takenBy then
+                local capName = dname
+                row:SetScript("OnClick",function()
+                    if brTargeted[myName] == capName then
+                        brTargeted[myName] = nil
+                        BR_BroadcastTarget(myName, nil)
+                    else
+                        brTargeted[myName] = capName
+                        TargetByName(capName)
+                        BR_BroadcastTarget(myName, capName)
+                    end
+                    UpdateAssignFrame()
+                end)
+            end
+            yOff = yOff - aRowH - 3
+            table.insert(assignFrame._brDeadBtns, row)
+        end
+
+        -- Rebirth cast button
+        if not assignFrame._brCastBtn then
+            local brBtn = CreateFrame("Button",nil,assignFrame,"UIPanelButtonTemplate")
+            brBtn:SetText("Rebirth!")
+            brBtn:SetScript("OnClick",function()
+                local tgt = brTargeted[myName]
+                if not tgt then return end
+                if UnitName("target") ~= tgt then TargetByName(tgt)
+                else CastSpellByName("Rebirth") end
+            end)
+            assignFrame._brCastBtn = brBtn
+        end
+        local brBtn = assignFrame._brCastBtn
+        brBtn:ClearAllPoints()
+        brBtn:ClearAllPoints()
+        brBtn:SetPoint("TOP",assignFrame,"TOP",0,yOff - 2)
+        local brBtnW = math.max(80, fontSize * 6)
+        brBtn:SetWidth(brBtnW)
+        brBtn:SetHeight(fontSize + 8)
+        brBtn:Show()
+        local hasTarget = brTargeted[myName] ~= nil
+        if hasTarget and brCDRem <= 0 then
+            brBtn:SetTextColor(0.8,0.3,1) brBtn:EnableMouse(true) brBtn:SetAlpha(1)
+        else
+            brBtn:SetTextColor(0.5,0.5,0.5) brBtn:EnableMouse(false) brBtn:SetAlpha(0.5)
+        end
+        yOff = yOff - (fontSize + 8) - 6
+    else
+        -- Not a healer-druid: hide any BR widgets in assignFrame
+        if assignFrame._brSep     then assignFrame._brSep:Hide()     end
+        if assignFrame._brIconF   then assignFrame._brIconF:Hide()   end
+        if assignFrame._brLbl     then assignFrame._brLbl:Hide()     end
+        if assignFrame._brCastBtn then assignFrame._brCastBtn:Hide() end
+        if assignFrame._brDeadBtns then
+            for _,b in ipairs(assignFrame._brDeadBtns) do b:Hide() end
+        end
+    end
+
     local totalH = math.abs(yOff) + rowStep + 4
     if totalH < 60 then totalH = 60 end
     assignFrame:SetHeight(totalH)
@@ -1294,41 +1656,46 @@ end
 -- DRUID INNERVATE FRAME
 -------------------------------------------------------------------------------
 local function UpdateDruidAssignFrame()
-    local myName = UnitName("player")
-    local tmpl   = GetActiveTemplate()
-    local inRaid = GetNumRaidMembers() > 0
-    local showOutside = HealAssignDB and HealAssignDB.options and HealAssignDB.options.showAssignFrame
+    local myName     = UnitName("player")
+    local tmpl       = GetActiveTemplate()
+    local inRaid     = GetNumRaidMembers() > 0
+    local showOutside= HealAssignDB and HealAssignDB.options and HealAssignDB.options.showAssignFrame
+    local myPdata    = tmpl and tmpl.roster and tmpl.roster[myName]
 
-    local myPdata = tmpl and tmpl.roster and tmpl.roster[myName]
-    local isDruid = myPdata and myPdata.class == "DRUID" and not (myPdata.tagH)
-    local assignedHealer = isDruid and tmpl and tmpl.innervate and tmpl.innervate[myName]
-
-    if not assignedHealer or (not inRaid and not showOutside) then
+    -- Determine role
+    -- Use UnitClass directly - always available regardless of roster state
+    local _,playerClass = UnitClass("player")
+    local isDruid       = playerClass == "DRUID"
+    local isHealerDruid = isDruid and myPdata and myPdata.tagH
+    -- Healer-druids get BR in assignFrame, not here
+    -- Non-druids don't get this window at all
+    if not isDruid or isHealerDruid then
+        if druidAssignFrame then druidAssignFrame:Hide() end
+        return
+    end
+    if (not inRaid and not showOutside) or not HA_ShouldShow() then
         if druidAssignFrame then druidAssignFrame:Hide() end
         return
     end
 
-    -- Layout constants (all scale with fontSize)
-    local fontSize = (HealAssignDB and HealAssignDB.options and HealAssignDB.options.fontSize) or 12
-    local PAD     = 5
-    local titleH  = fontSize + 6     -- title row height
-    local rowStep = fontSize + 4     -- mana row height
-    local ICON_SZ = math.floor(fontSize * 2.5)
+    local assignedHealer = tmpl and tmpl.innervate and tmpl.innervate[myName]
+
+    -- Layout constants
+    local fontSize  = (HealAssignDB and HealAssignDB.options and HealAssignDB.options.fontSize) or 12
+    local PAD       = 5
+    local titleH    = fontSize + 6
+    local rowStep   = fontSize + 4
+    local ICON_SZ   = math.floor(fontSize * 2.5)
     if ICON_SZ < 20 then ICON_SZ = 20 end
     if ICON_SZ > 48 then ICON_SZ = 48 end
-    local BTN_H   = fontSize + 8
-    local cdFontSz = math.floor(fontSize * 0.85)
+    local BTN_H     = fontSize + 8
+    local cdFontSz  = math.floor(fontSize * 0.85)
     if cdFontSz < 8 then cdFontSz = 8 end
-
-    -- Frame width scales with fontSize
-    local frameW = 100 + fontSize * 8
+    local frameW    = 100 + fontSize * 8
     if frameW < 120 then frameW = 120 end
     if frameW > 260 then frameW = 260 end
 
-    -- Total height: PAD + title + PAD/2 + mana + PAD + icon + PAD + button + PAD
-    local totalH = PAD + titleH + 4 + rowStep + PAD + ICON_SZ + PAD + BTN_H + PAD
-
-    -- Create frame once
+    -- Create frame once (always, regardless of assignment)
     if not druidAssignFrame then
         druidAssignFrame = CreateFrame("Frame","HealAssignDruidAssignFrame",UIParent)
         druidAssignFrame:SetMovable(true)
@@ -1337,7 +1704,6 @@ local function UpdateDruidAssignFrame()
         druidAssignFrame:SetScript("OnDragStart",function() this:StartMoving() end)
         druidAssignFrame:SetScript("OnDragStop",function()
             this:StopMovingOrSizing()
-            -- FIX 2: save position so it restores on next show
             local _,_,_,x,y = this:GetPoint()
             if HealAssignDB and HealAssignDB.options then
                 HealAssignDB.options.druidFrameX = x
@@ -1351,12 +1717,11 @@ local function UpdateDruidAssignFrame()
             tile=true,tileSize=8,edgeSize=12,
             insets={left=4,right=4,top=4,bottom=4}
         })
-        -- FIX 2: restore saved position or use default
         local _dx = HealAssignDB and HealAssignDB.options and HealAssignDB.options.druidFrameX or 20
         local _dy = HealAssignDB and HealAssignDB.options and HealAssignDB.options.druidFrameY or -200
         druidAssignFrame:SetPoint("TOPLEFT",UIParent,"TOPLEFT",_dx,_dy)
 
-        -- Options button (top-right corner, fixed size)
+        -- Options button
         local optBtn = CreateFrame("Button",nil,druidAssignFrame,"UIPanelButtonTemplate")
         optBtn:SetWidth(24) optBtn:SetHeight(16)
         optBtn:SetPoint("TOPRIGHT",druidAssignFrame,"TOPRIGHT",-4,-4)
@@ -1366,21 +1731,19 @@ local function UpdateDruidAssignFrame()
             else HealAssign_OpenOptions() end
         end)
 
-        -- Title fontstring (healer name)
+        -- Innervate widgets (shown only when assigned)
         local tFS = druidAssignFrame:CreateFontString(nil,"OVERLAY")
         tFS:SetJustifyH("CENTER")
         druidAssignFrame._titleFS = tFS
 
-        -- Mana fontstring
         local mFS = druidAssignFrame:CreateFontString(nil,"OVERLAY")
         mFS:SetJustifyH("CENTER")
         druidAssignFrame._manaFS = mFS
 
-        -- Icon frame + texture + CD label
         local iFrame = CreateFrame("Frame",nil,druidAssignFrame)
         local iTex = iFrame:CreateTexture(nil,"BACKGROUND")
         iTex:SetTexture(INN_ICON)
-        iTex:SetAllPoints(iFrame)          -- FIX: texture fills iFrame
+        iTex:SetAllPoints(iFrame)
         local iCDFS = iFrame:CreateFontString(nil,"OVERLAY","GameFontNormal")
         iCDFS:SetPoint("CENTER",iFrame,"CENTER",0,0)
         iCDFS:SetTextColor(1,1,0)
@@ -1388,12 +1751,11 @@ local function UpdateDruidAssignFrame()
         druidAssignFrame._iconTex   = iTex
         druidAssignFrame._iconCDFS  = iCDFS
 
-        -- Cast button
         local btn = CreateFrame("Button",nil,druidAssignFrame,"UIPanelButtonTemplate")
         btn:SetText("Innervate!")
         btn:SetScript("OnClick",function()
             local t2 = GetActiveTemplate()
-            local n = UnitName("player")
+            local n  = UnitName("player")
             if not t2 then return end
             local h = t2.innervate and t2.innervate[n]
             if not h then return end
@@ -1401,92 +1763,294 @@ local function UpdateDruidAssignFrame()
             else CastSpellByName("Innervate") end
         end)
         druidAssignFrame._castBtn = btn
+
+        -- BR widgets (always present)
+        local brSep = druidAssignFrame:CreateTexture(nil,"ARTWORK")
+        brSep:SetHeight(1)
+        brSep:SetTexture(0.4,0.4,0.4,0.8)
+        druidAssignFrame._brSep = brSep
+
+        local brIF = CreateFrame("Frame",nil,druidAssignFrame)
+        local brIT = brIF:CreateTexture(nil,"BACKGROUND")
+        brIT:SetTexture(BR_ICON)
+        brIT:SetAllPoints(brIF)
+        local brCDT = brIF:CreateFontString(nil,"OVERLAY","GameFontNormal")
+        brCDT:SetPoint("CENTER",brIF,"CENTER",0,0)
+        brCDT:SetTextColor(1,1,0)
+        druidAssignFrame._brIconF   = brIF
+        druidAssignFrame._brIconTex = brIT
+        druidAssignFrame._brCDFS    = brCDT
+
+        local brBtn = CreateFrame("Button",nil,druidAssignFrame,"UIPanelButtonTemplate")
+        brBtn:SetText("Rebirth!")
+        brBtn:SetScript("OnClick",function()
+            local n   = UnitName("player")
+            local tgt = brTargeted[n]
+            if not tgt then return end
+            if UnitName("target") ~= tgt then TargetByName(tgt)
+            else CastSpellByName("Rebirth") end
+        end)
+        druidAssignFrame._brCastBtn = brBtn
+
+        druidAssignFrame._brDeadBtns = {}
     end
 
-    -- Update backdrop alpha
+    -- Update backdrop
     local _a = (HealAssignDB and HealAssignDB.options and HealAssignDB.options.windowAlpha) or 0.95
     druidAssignFrame:SetBackdropColor(0.05,0.05,0.1,_a)
     druidAssignFrame:SetBackdropBorderColor(0.3,0.6,1,0.8)
-
-    -- Resize frame
     druidAssignFrame:SetWidth(frameW)
-    druidAssignFrame:SetHeight(totalH)
 
-    -- Running Y cursor from top
     local curY = -PAD
+    local cdRem = 0
 
-    -- Title: healer name
-    local hr,hg,hb = 1,1,1
-    if tmpl.roster and tmpl.roster[assignedHealer] then
-        hr,hg,hb = GetClassColor(tmpl.roster[assignedHealer].class)
-    end
-    local tFS = druidAssignFrame._titleFS
-    tFS:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"OUTLINE")
-    tFS:SetTextColor(hr,hg,hb)
-    tFS:SetText(assignedHealer)
-    tFS:ClearAllPoints()
-    tFS:SetPoint("TOP",druidAssignFrame,"TOP",0,curY)
-    tFS:SetWidth(frameW - 32)   -- leave room for O button
-    curY = curY - titleH - 4
+    -- ── INNERVATE section (only if assigned) ─────────────────────
+    if assignedHealer then
+        local hr,hg,hb = 1,1,1
+        if tmpl.roster and tmpl.roster[assignedHealer] then
+            hr,hg,hb = GetClassColor(tmpl.roster[assignedHealer].class)
+        end
+        local tFS = druidAssignFrame._titleFS
+        tFS:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"OUTLINE")
+        tFS:SetTextColor(hr,hg,hb)
+        tFS:SetText(assignedHealer)
+        tFS:ClearAllPoints()
+        tFS:SetPoint("TOP",druidAssignFrame,"TOP",0,curY)
+        tFS:SetWidth(frameW - 32)
+        tFS:Show()
+        curY = curY - titleH - 4
 
-    -- Mana
-    local mFS = druidAssignFrame._manaFS
-    mFS:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
-    mFS:ClearAllPoints()
-    mFS:SetPoint("TOP",druidAssignFrame,"TOP",0,curY)
-    mFS:SetWidth(frameW - 12)
-    local manaPct = INN_GetHealerMana(assignedHealer)
-    if manaPct then
-        local mr = manaPct < 50 and 1 or 0.3
-        local mg = manaPct >= 50 and 0.9 or 0.3
-        mFS:SetTextColor(mr,mg,0.3)
-        mFS:SetText("Mana: "..manaPct.."%")
+        local mFS = druidAssignFrame._manaFS
+        mFS:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
+        mFS:ClearAllPoints()
+        mFS:SetPoint("TOP",druidAssignFrame,"TOP",0,curY)
+        mFS:SetWidth(frameW - 12)
+        mFS:SetHeight(rowStep)
+        local manaPct = INN_GetHealerMana(assignedHealer)
+        if manaPct then
+            local mr = manaPct < 50 and 1 or 0.3
+            local mg = manaPct >= 50 and 0.9 or 0.3
+            mFS:SetTextColor(mr,mg,0.3)
+            mFS:SetText("Mana: "..manaPct.."%")
+        else
+            mFS:SetTextColor(0.5,0.5,0.5)
+            mFS:SetText("Mana: ?")
+        end
+        mFS:Show()
+        curY = curY - rowStep - PAD
+
+        local iFrame = druidAssignFrame._iconFrame
+        iFrame:ClearAllPoints()
+        iFrame:SetPoint("TOP",druidAssignFrame,"TOP",0,curY)
+        iFrame:SetWidth(ICON_SZ) iFrame:SetHeight(ICON_SZ)
+        iFrame:Show()
+
+        cdRem = INN_GetCDRemaining(myName)
+        local iTex  = druidAssignFrame._iconTex
+        local iCDFS = druidAssignFrame._iconCDFS
+        iCDFS:SetFont("Fonts\\FRIZQT__.TTF",cdFontSz,"OUTLINE")
+        if cdRem > 0 then
+            iTex:SetVertexColor(0.3,0.3,0.3)
+            local mins = math.floor(cdRem/60)
+            local secs = math.floor(math.mod(cdRem,60))
+            iCDFS:SetText(string.format("%d:%02d",mins,secs))
+        else
+            iTex:SetVertexColor(1,1,1)
+            iCDFS:SetText("")
+        end
+        curY = curY - ICON_SZ - PAD
+
+        local btn = druidAssignFrame._castBtn
+        btn:ClearAllPoints()
+        btn:SetPoint("TOP",druidAssignFrame,"TOP",0,curY)
+        local btnW = math.max(80, fontSize * 6)
+        btn:SetWidth(btnW) btn:SetHeight(BTN_H)
+        btn:Show()
+        if cdRem > 0 then
+            btn:SetTextColor(0.5,0.5,0.5) btn:EnableMouse(false) btn:SetAlpha(0.5)
+        else
+            btn:SetTextColor(0.1,1,0.1) btn:EnableMouse(true) btn:SetAlpha(1)
+        end
+        curY = curY - BTN_H - PAD
     else
-        mFS:SetTextColor(0.5,0.5,0.5)
-        mFS:SetText("Mana: ?")
+        -- Hide innervate widgets
+        druidAssignFrame._titleFS:Hide()
+        druidAssignFrame._manaFS:Hide()
+        druidAssignFrame._iconFrame:Hide()
+        druidAssignFrame._castBtn:Hide()
     end
-    curY = curY - rowStep - PAD
 
-    -- Icon (centered horizontally)
-    local iFrame = druidAssignFrame._iconFrame
-    iFrame:ClearAllPoints()
-    iFrame:SetPoint("TOP",druidAssignFrame,"TOP",0,curY)
-    iFrame:SetWidth(ICON_SZ)
-    iFrame:SetHeight(ICON_SZ)
-
-    -- CD from innCD table (populated when cast is detected via combat log or addon msg)
-    local cdRem = INN_GetCDRemaining(myName)
-    local iTex  = druidAssignFrame._iconTex
-    local iCDFS = druidAssignFrame._iconCDFS
-    iCDFS:SetFont("Fonts\\FRIZQT__.TTF",cdFontSz,"OUTLINE")
-    if cdRem > 0 then
-        iTex:SetVertexColor(0.3,0.3,0.3)
-        local mins = math.floor(cdRem/60)
-        local secs = math.floor(math.mod(cdRem,60))
-        iCDFS:SetText(string.format("%d:%02d",mins,secs))
+    -- ── REBIRTH section (always shown) ───────────────────────────
+    -- Separator (only when innervate section shown above)
+    if assignedHealer then
+        local sep = druidAssignFrame._brSep
+        sep:ClearAllPoints()
+        sep:SetPoint("TOPLEFT",druidAssignFrame,"TOPLEFT",PAD,curY)
+        sep:SetPoint("TOPRIGHT",druidAssignFrame,"TOPRIGHT",-PAD,curY)
+        sep:Show()
+        curY = curY - 8
     else
-        iTex:SetVertexColor(1,1,1)
-        iCDFS:SetText("")
+        druidAssignFrame._brSep:Hide()
+    end
+
+    -- Title "Rebirth" (gold, like section headers)
+    if not druidAssignFrame._brTitleFS then
+        local tfs = druidAssignFrame:CreateFontString(nil,"OVERLAY")
+        tfs:SetJustifyH("CENTER")
+        druidAssignFrame._brTitleFS = tfs
+    end
+    druidAssignFrame._brTitleFS:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"OUTLINE")
+    druidAssignFrame._brTitleFS:SetTextColor(1,0.82,0)
+    druidAssignFrame._brTitleFS:SetText("Rebirth")
+    druidAssignFrame._brTitleFS:ClearAllPoints()
+    druidAssignFrame._brTitleFS:SetPoint("TOP",druidAssignFrame,"TOP",0,curY)
+    druidAssignFrame._brTitleFS:SetWidth(frameW - 32)
+    druidAssignFrame._brTitleFS:Show()
+    curY = curY - titleH - 2
+
+    -- BR Icon centered
+    local brIF = druidAssignFrame._brIconF
+    brIF:ClearAllPoints()
+    brIF:SetPoint("TOP",druidAssignFrame,"TOP",0,curY)
+    brIF:SetWidth(ICON_SZ) brIF:SetHeight(ICON_SZ)
+    brIF:Show()
+
+    local brCDRem = BR_GetCDRemaining(UnitName("player"))
+    local brIT  = druidAssignFrame._brIconTex
+    local brCDT = druidAssignFrame._brCDFS
+    brCDT:SetFont("Fonts\\FRIZQT__.TTF",cdFontSz,"OUTLINE")
+    if brCDRem > 0 then
+        brIT:SetVertexColor(0.3,0.3,0.3)
+        local bm = math.floor(brCDRem/60)
+        local bs = math.floor(math.mod(brCDRem,60))
+        brCDT:SetText(string.format("%d:%02d",bm,bs))
+    else
+        brIT:SetVertexColor(1,1,1)
+        brCDT:SetText("")
     end
     curY = curY - ICON_SZ - PAD
 
-    -- Cast button: fixed width centered, not stretched
-    local btn = druidAssignFrame._castBtn
-    btn:ClearAllPoints()
-    btn:SetPoint("TOP",druidAssignFrame,"TOP",0,curY)
-    local btnW = math.max(80, fontSize * 6)
-    btn:SetWidth(btnW)
-    btn:SetHeight(BTN_H)
-    if cdRem > 0 then
-        btn:SetTextColor(0.5,0.5,0.5)
-        btn:EnableMouse(false)
-        btn:SetAlpha(0.5)
-    else
-        btn:SetTextColor(0.1,1,0.1)
-        btn:EnableMouse(true)
-        btn:SetAlpha(1)
+    -- Dead list: styled rows with name left + BR icon status right
+    for _,b in ipairs(druidAssignFrame._brDeadBtns) do b:Hide() end
+    druidAssignFrame._brDeadBtns = {}
+
+    local myName2  = UnitName("player")
+    local rowH2    = fontSize + 8
+    local innerW   = frameW - PAD*2
+    local iconSzSm = math.floor(fontSize * 1.2)  -- small icon for status
+    if iconSzSm < 10 then iconSzSm = 10 end
+    if iconSzSm > 20 then iconSzSm = 20 end
+
+    for _,d in ipairs(brDeadList) do
+        local dname   = d.name
+        local takenBy = nil
+        for druid,target in pairs(brTargeted) do
+            if target == dname and druid ~= myName2 then takenBy = druid end
+        end
+        local isMine = brTargeted[myName2] == dname
+
+        -- Class color
+        local cr,cg,cb = 0.6,0.5,0.5
+        if tmpl and tmpl.roster and tmpl.roster[dname] then
+            cr,cg,cb = GetClassColor(tmpl.roster[dname].class)
+        end
+
+        -- Row frame with backdrop like HAddBlock
+        local row = CreateFrame("Button",nil,druidAssignFrame)
+        row:SetPoint("TOPLEFT",druidAssignFrame,"TOPLEFT",PAD,curY)
+        row:SetWidth(innerW)
+        row:SetHeight(rowH2)
+        row:EnableMouse(not takenBy)
+        row:SetBackdrop({
+            bgFile   = "Interface\\Buttons\\WHITE8X8",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile=true, tileSize=8, edgeSize=8,
+            insets={left=2,right=2,top=2,bottom=2}
+        })
+        if isMine then
+            row:SetBackdropColor(cr*0.35, cg*0.35, cb*0.35, 0.9)
+            row:SetBackdropBorderColor(cr, cg, cb, 0.9)
+        elseif takenBy then
+            row:SetBackdropColor(0.1,0.1,0.1,0.6)
+            row:SetBackdropBorderColor(0.3,0.3,0.3,0.4)
+        else
+            row:SetBackdropColor(cr*0.12, cg*0.12, cb*0.12, 0.8)
+            row:SetBackdropBorderColor(cr*0.4, cg*0.4, cb*0.4, 0.7)
+        end
+
+        -- Name text (left aligned, leave room for icon on right)
+        local fs = row:CreateFontString(nil,"OVERLAY")
+        fs:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
+        fs:SetPoint("LEFT",  row,"LEFT",  6, 0)
+        fs:SetPoint("RIGHT", row,"RIGHT", -(iconSzSm + 8), 0)
+        fs:SetHeight(rowH2)
+        fs:SetJustifyH("LEFT")
+        fs:SetJustifyV("MIDDLE")
+        if isMine then
+            fs:SetTextColor(cr, cg, cb)
+        elseif takenBy then
+            fs:SetTextColor(0.4,0.4,0.4)
+            fs:SetText(dname.." |cff666666("..takenBy..")|r")
+        else
+            fs:SetTextColor(0.9,0.85,0.75)
+        end
+        if not takenBy then fs:SetText(dname) end
+
+        -- Status icon (BR icon right side)
+        local icF = CreateFrame("Frame",nil,row)
+        icF:SetWidth(iconSzSm) icF:SetHeight(iconSzSm)
+        icF:SetPoint("RIGHT",row,"RIGHT",-4,0)
+        local icT = icF:CreateTexture(nil,"OVERLAY")
+        icT:SetAllPoints(icF)
+        icT:SetTexture(BR_ICON)
+        if isMine then
+            icT:SetVertexColor(1,0.85,0)    -- yellow: claimed by me
+        elseif takenBy then
+            icT:SetVertexColor(1,0.2,0.2)   -- red: claimed by other druid
+        else
+            icT:SetVertexColor(0.3,1,0.3)   -- green: free
+        end
+
+        -- Click: claim/unclaim
+        if not takenBy then
+            local capName = dname
+            row:SetScript("OnClick",function()
+                if brTargeted[myName2] == capName then
+                    brTargeted[myName2] = nil
+                    BR_BroadcastTarget(myName2, nil)
+                else
+                    brTargeted[myName2] = capName
+                    TargetByName(capName)
+                    BR_BroadcastTarget(myName2, capName)
+                end
+                UpdateDruidAssignFrame()
+            end)
+        end
+
+        curY = curY - rowH2 - 3
+        table.insert(druidAssignFrame._brDeadBtns, row)
     end
 
+    -- Gap before cast button
+    if table.getn(brDeadList) > 0 then curY = curY - 2 end
+
+    -- Rebirth cast button
+    local brBtn = druidAssignFrame._brCastBtn
+    brBtn:ClearAllPoints()
+    brBtn:SetPoint("TOP",druidAssignFrame,"TOP",0,curY - 2)
+    local brBtnW = math.max(80, fontSize * 6)
+    brBtn:SetWidth(brBtnW) brBtn:SetHeight(BTN_H)
+    brBtn:Show()
+    local hasTarget = brTargeted[myName2] ~= nil
+    if hasTarget and brCDRem <= 0 then
+        brBtn:SetTextColor(0.8,0.3,1) brBtn:EnableMouse(true) brBtn:SetAlpha(1)
+    else
+        brBtn:SetTextColor(0.5,0.5,0.5) brBtn:EnableMouse(false) brBtn:SetAlpha(0.5)
+    end
+    curY = curY - BTN_H - PAD
+    -- Resize and show
+    local fullH = math.abs(curY) + PAD
+    druidAssignFrame:SetHeight(fullH)
     druidAssignFrame:Show()
 end
 
@@ -2016,22 +2580,41 @@ local function RebuildRosterRows()
     if not tmpl then return end
 
     local members = GetRaidMembers()
+    local numRaid = GetNumRaidMembers()
     -- Build lookup of current raid members
     local currentMembers = {}
     for _,m in ipairs(members) do
         currentMembers[m.name] = m
     end
-    -- Remove players no longer in raid (keeps roster clean between raids)
-    local toRemove = {}
-    for pname,_ in pairs(tmpl.roster) do
-        if not currentMembers[pname] then
-            table.insert(toRemove, pname)
+    -- Remove players no longer in raid (protected against /reload race condition)
+    if numRaid > 0 then
+        if HA_reloadProtect then
+            if table.getn(members) > 0 then
+                HA_reloadProtect = false  -- raid confirmed, safe to clean
+            else
+                return  -- raid not loaded yet, don't touch roster
+            end
+        end
+        local toRemove = {}
+        for pname,_ in pairs(tmpl.roster) do
+            if not currentMembers[pname] then
+                table.insert(toRemove, pname)
+            end
+        end
+        for _,pname in ipairs(toRemove) do
+            tmpl.roster[pname] = nil
+        end
+        if tmpl.healers then
+            local newHealers = {}
+            for _,h in ipairs(tmpl.healers) do
+                if currentMembers[h.name] then
+                    table.insert(newHealers, h)
+                end
+            end
+            tmpl.healers = newHealers
         end
     end
-    for _,pname in ipairs(toRemove) do
-        tmpl.roster[pname] = nil
-    end
-    -- Add new members, update existing
+    -- Add new members, update existing (always safe)
     for _,m in ipairs(members) do
         if not tmpl.roster[m.name] then
             tmpl.roster[m.name] = {class=m.class, subgroup=m.subgroup or 1}
@@ -2039,16 +2622,6 @@ local function RebuildRosterRows()
             tmpl.roster[m.name].class    = m.class
             tmpl.roster[m.name].subgroup = m.subgroup or tmpl.roster[m.name].subgroup or 1
         end
-    end
-    -- Also sync healers list - remove healers no longer in raid
-    if tmpl.healers then
-        local newHealers = {}
-        for _,h in ipairs(tmpl.healers) do
-            if currentMembers[h.name] then
-                table.insert(newHealers, h)
-            end
-        end
-        tmpl.healers = newHealers
     end
 
     -- Build groups 1-8
@@ -2162,8 +2735,8 @@ local function RebuildRosterRows()
             tBtn:SetScript("OnClick",function()
                 local entry = tmpl.roster[capturedName]
                 if entry then
-                    entry.tagT = not entry.tagT
-                    if entry.tagT then entry.tagH = false end  -- T excludes H
+                    entry.tagT = entry.tagT and nil or true
+                    if entry.tagT then entry.tagH = nil end
                     SyncHealersFromRoster(tmpl)
                     RebuildRosterRows()
                     RebuildMainGrid()
@@ -2174,12 +2747,13 @@ local function RebuildRosterRows()
             hBtn:SetScript("OnClick",function()
                 local entry = tmpl.roster[capturedName]
                 if entry then
-                    entry.tagH = not entry.tagH
-                    if entry.tagH then entry.tagT = false end  -- H excludes T
+                    entry.tagH = entry.tagH and nil or true
+                    if entry.tagH then entry.tagT = nil end
                     SyncHealersFromRoster(tmpl)
                     RebuildRosterRows()
                     RebuildMainGrid()
                     UpdateAssignFrame()
+                    UpdateDruidAssignFrame()
                 end
             end)
 
@@ -2187,7 +2761,7 @@ local function RebuildRosterRows()
             vBtn:SetScript("OnClick",function()
                 local entry = tmpl.roster[capturedVName]
                 if entry then
-                    entry.tagV = not entry.tagV
+                    entry.tagV = entry.tagV and nil or true
                     RebuildRosterRows()
                     UpdateAssignFrame()
                 end
@@ -2405,6 +2979,22 @@ function CreateOptionsFrame()
     local showLbl = optionsFrame:CreateFontString(nil,"OVERLAY","GameFontNormal")
     showLbl:SetPoint("LEFT",showCB,"RIGHT",4,0)
     showLbl:SetText("Show Assignments outside raid")
+    y = y-26
+
+    -- Hide in Battleground checkbox
+    local bgCB = CreateFrame("CheckButton",nil,optionsFrame,"UICheckButtonTemplate")
+    bgCB:SetWidth(20)
+    bgCB:SetHeight(20)
+    bgCB:SetPoint("TOPLEFT",optionsFrame,"TOPLEFT",14,y)
+    bgCB:SetChecked(HealAssignDB.options.hideInBG ~= false)
+    bgCB:SetScript("OnClick",function()
+        HealAssignDB.options.hideInBG = this:GetChecked()
+        UpdateAssignFrame()
+        UpdateDruidAssignFrame()
+    end)
+    local bgLbl = optionsFrame:CreateFontString(nil,"OVERLAY","GameFontNormal")
+    bgLbl:SetPoint("LEFT",bgCB,"RIGHT",4,0)
+    bgLbl:SetText("Hide in Battlegrounds")
     y = y-36
 
     -- Custom targets
@@ -2483,6 +3073,63 @@ function CreateOptionsFrame()
     optionsFrame:Raise()
     optionsFrame:Show()
     PushWindow(optionsFrame)
+end
+
+-------------------------------------------------------------------------------
+-- MINIMAP BUTTON
+-- Фрейм создаётся через HealAssign.xml (по образцу ItemRack)
+-------------------------------------------------------------------------------
+local function CreateMinimapButton()
+    if not HealAssignMinimapBtn then return end
+
+    -- Position on minimap edge
+    local angle = HealAssignDB.minimapAngle or 220
+    local function UpdateMinimapPos(a)
+        local x = math.cos(math.rad(a)) * 80
+        local y = math.sin(math.rad(a)) * 80
+        HealAssignMinimapBtn:ClearAllPoints()
+        HealAssignMinimapBtn:SetPoint("TOPLEFT", Minimap, "TOPLEFT", 52 - x, y - 52)
+    end
+    UpdateMinimapPos(angle)
+    HealAssignMinimapBtn:Show()
+
+    -- Click: toggle main window
+    HealAssignMinimapBtn:SetScript("OnClick", function()
+        if mainFrame and mainFrame:IsShown() then
+            mainFrame:Hide()
+        else
+            if _CreateMainFrame then _CreateMainFrame() end
+        end
+    end)
+
+    -- Tooltip
+    HealAssignMinimapBtn:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(this, "ANCHOR_LEFT")
+        GameTooltip:SetText("HealAssign v"..ADDON_VERSION)
+        GameTooltip:AddLine("Click to toggle main window", 1, 1, 1)
+        GameTooltip:Show()
+    end)
+    HealAssignMinimapBtn:SetScript("OnLeave", function()
+        GameTooltip:Hide()
+    end)
+
+    -- Drag to reposition around minimap
+    HealAssignMinimapBtn:SetScript("OnDragStart", function()
+        this:LockHighlight()
+        this:SetScript("OnUpdate", function()
+            local mx, my = Minimap:GetCenter()
+            local cx, cy = GetCursorPosition()
+            local s = UIParent:GetEffectiveScale()
+            cx, cy = cx/s, cy/s
+            local a = math.deg(math.atan2(cy - my, cx - mx))
+            HealAssignDB.minimapAngle = a
+            UpdateMinimapPos(a)
+        end)
+    end)
+    HealAssignMinimapBtn:SetScript("OnDragStop", function()
+        this:UnlockHighlight()
+        this:SetScript("OnUpdate", nil)
+    end)
 end
 
 -------------------------------------------------------------------------------
@@ -2685,6 +3332,7 @@ end
 -- Wire up forward references now that all functions are defined
 _RebuildMainGrid       = RebuildMainGrid
 _UpdateAssignFrame      = UpdateAssignFrame
+_CreateMainFrame        = CreateMainFrame
 _UpdateDruidAssignFrame = UpdateDruidAssignFrame
 _SyncHealersFromRoster = SyncHealersFromRoster
 _RebuildRosterRows     = RebuildRosterRows
@@ -2761,6 +3409,38 @@ local function HandleAddonMessage(prefix,msg,channel,sender)
         return
     end
 
+    -- BR: dead T/H notification
+    local _,_,brDeadName = string.find(msg,"^BR_DEAD;(.+)$")
+    if brDeadName then
+        BR_AddDead(brDeadName)
+        UpdateDruidAssignFrame()
+        return
+    end
+
+    -- BR: druid targeting
+    local _,_,brDruid,brTarget = string.find(msg,"^BR_TARGET;([^;]+);(.+)$")
+    if brDruid then
+        brTargeted[brDruid] = brTarget
+        UpdateDruidAssignFrame()
+        return
+    end
+
+    -- BR: druid cleared target
+    local _,_,brClearDruid = string.find(msg,"^BR_CLEAR;(.+)$")
+    if brClearDruid then
+        brTargeted[brClearDruid] = nil
+        UpdateDruidAssignFrame()
+        return
+    end
+
+    -- BR: cast broadcast (to track CD for others)
+    local _,_,brCastDruid = string.find(msg,"^BR_CAST;(.+)$")
+    if brCastDruid then
+        brCD[brCastDruid] = GetTime()
+        UpdateDruidAssignFrame()
+        return
+    end
+
     -- Death signal
     local _,_,deadName = string.find(msg,"^DEAD;(.+)$")
     if deadName then
@@ -2806,15 +3486,19 @@ local function HandleAddonMessage(prefix,msg,channel,sender)
 
         local tmpl = Deserialize(fullData)
         if tmpl then
-            HealAssignDB.templates[tmpl.name] = tmpl
-            HealAssignDB.activeTemplate = tmpl.name
-            currentTemplate = tmpl
-            DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Received '"..tmpl.name.."' from "..sender)
-
-            if mainFrame and mainFrame:IsShown() then RebuildMainGrid() end
-            UpdateAssignFrame()
-
-            if IsRaidLeader() then CreateRLFrame() end
+            HealAssignDB.templates[tmpl.name] = DeepCopy(tmpl)
+            -- Only apply received template if we are NOT the raid leader
+            -- (RL sends templates, non-RL receives and applies them)
+            if not IsRaidLeader() then
+                HealAssignDB.activeTemplate = tmpl.name
+                currentTemplate = tmpl
+                DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Received '"..tmpl.name.."' from "..sender)
+                if mainFrame and mainFrame:IsShown() then RebuildMainGrid() end
+                UpdateAssignFrame()
+                if IsRaidLeader() then CreateRLFrame() end
+            else
+                DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign:|r Stored template '"..tmpl.name.."' from "..sender)
+            end
         end
     end
 end
@@ -2824,17 +3508,47 @@ end
 -------------------------------------------------------------------------------
 local deathFrame = CreateFrame("Frame","HealAssignDeathFrame")
 deathFrame:RegisterEvent("CHAT_MSG_COMBAT_HOSTILE_DEATH")
+deathFrame:RegisterEvent("CHAT_MSG_COMBAT_SELF_KILLS")
+deathFrame:RegisterEvent("CHAT_MSG_COMBAT_FRIENDLYPLAYER_DEATH")
 deathFrame:RegisterEvent("CHAT_MSG_COMBAT_FRIENDLY_DEATH")
+deathFrame:RegisterEvent("CHAT_MSG_SYSTEM")
+deathFrame:RegisterEvent("UNIT_HEALTH")
 deathFrame:SetScript("OnEvent",function()
+    -- UNIT_HEALTH: catch death when health hits 0
+    if event == "UNIT_HEALTH" then
+        local unit = arg1
+        if not unit then return end
+        if not UnitIsDeadOrGhost(unit) then return end
+        local deadName = UnitName(unit)
+        if not deadName then return end
+        local tmpl2 = GetActiveTemplate()
+        if not tmpl2 or not tmpl2.roster then return end
+        local pd = tmpl2.roster[deadName]
+        if not pd then return end
+        if pd.tagT or pd.tagH then
+            BR_AddDead(deadName)
+            UpdateDruidAssignFrame()
+            UpdateAssignFrame()
+        end
+        return
+    end
+
     local msg = arg1
     if not msg then return end
+
 
     local deadName = nil
     if msg == "You die." then
         deadName = UnitName("player")
     else
+        -- "X dies." pattern
         local _,_,cap = string.find(msg,"^(.+) dies%.$")
         if cap then deadName = cap end
+        -- "X has died." pattern (also used in 1.12)
+        if not deadName then
+            local _,_,cap2 = string.find(msg,"^(.+) has died%.$")
+            if cap2 then deadName = cap2 end
+        end
     end
     if not deadName then return end
 
@@ -2845,17 +3559,33 @@ deathFrame:SetScript("OnEvent",function()
     local numParty = GetNumPartyMembers()
     if (not numRaid or numRaid == 0) and (not numParty or numParty == 0) then return end
 
+    local chan
+    if numRaid and numRaid > 0 then chan = "RAID"
+    elseif numParty and numParty > 0 then chan = "PARTY" end
+
+    -- Healer death
     for _,h in ipairs(tmpl.healers) do
         if h.name == deadName then
-            local chan
-            if numRaid and numRaid > 0 then chan = "RAID"
-            elseif numParty and numParty > 0 then chan = "PARTY" end
             if chan then pcall(SendAddonMessage, COMM_PREFIX,"DEAD;"..deadName, chan) end
-
             TriggerHealerDeath(deadName, h.targets)
             UpdateAssignFrame()
             if rlFrame and rlFrame:IsShown() then UpdateRLFrame() end
+            -- Also add to BR dead list
+            BR_AddDead(deadName)
+            if chan then pcall(SendAddonMessage, COMM_PREFIX,"BR_DEAD;"..deadName, chan) end
+            UpdateDruidAssignFrame()
             return
+        end
+    end
+
+    -- Tank death (tagT) or healer not in tmpl.healers but has tagH
+    if tmpl.roster and tmpl.roster[deadName] then
+        local pd = tmpl.roster[deadName]
+        if pd.tagT or pd.tagH then
+            BR_AddDead(deadName)
+            if chan then pcall(SendAddonMessage, COMM_PREFIX,"BR_DEAD;"..deadName, chan) end
+            UpdateDruidAssignFrame()
+            UpdateAssignFrame()
         end
     end
 end)
@@ -2878,8 +3608,11 @@ end)
 -- Resurrection detection via combat log
 local rezFrame = CreateFrame("Frame","HealAssignRezFrame")
 rezFrame:RegisterEvent("CHAT_MSG_SPELL_RESURRECT")
+rezFrame:RegisterEvent("UNIT_HEALTH")
 rezFrame:RegisterEvent("CHAT_MSG_SPELL_SELF_CASTOTHER")
 rezFrame:RegisterEvent("CHAT_MSG_SPELL_OTHER_CASTOTHER")
+rezFrame:RegisterEvent("CHAT_MSG_SPELL_PERIODIC_FRIENDLYPLAYER_BUFFS")
+rezFrame:RegisterEvent("CHAT_MSG_SPELL_PERIODIC_SELF_BUFFS")
 
 -- Innervate detection via combat log messages
 -- "X gains Innervate." -> CHAT_MSG_SPELL_PERIODIC_FRIENDLYPLAYER_BUFFS
@@ -2960,6 +3693,11 @@ local function CheckAllRezd()
     end
     for _,name in ipairs(toRez) do
         RemoveDeadHealer(name)
+        BR_RemoveDead(name)
+    end
+    if table.getn(toRez) > 0 then
+        UpdateDruidAssignFrame()
+        UpdateAssignFrame()
     end
 end
 
@@ -2980,18 +3718,67 @@ rezFrame:SetScript("OnEvent",function()
         return
     end
 
+    -- UNIT_HEALTH: if someone in brDeadList is now alive - remove them
+    if event == "UNIT_HEALTH" then
+        local unit = arg1
+        if unit and not UnitIsDeadOrGhost(unit) then
+            local aliveName = UnitName(unit)
+            if aliveName then
+                for _,d in ipairs(brDeadList) do
+                    if d.name == aliveName then
+                        BR_RemoveDead(aliveName)
+                        RemoveDeadHealer(aliveName)
+                        UpdateDruidAssignFrame()
+                        UpdateAssignFrame()
+                        break
+                    end
+                end
+            end
+        end
+        return
+    end
+
+    -- BR cast detection via combat log
+    -- "X casts Rebirth on Y" / "You cast Rebirth on Y"
+    if event == "CHAT_MSG_SPELL_SELF_CASTOTHER" or event == "CHAT_MSG_SPELL_OTHER_CASTOTHER" then
+        local msg2 = arg1
+        if msg2 then
+            local _,_,caster,target = string.find(msg2,"^(.+) casts Rebirth on (.+)%.$")
+            if not caster then
+                local _,_,t2 = string.find(msg2,"^You cast Rebirth on (.+)%.$")
+                if t2 then caster = UnitName("player") target = t2 end
+            end
+            if caster then
+                brCD[caster] = GetTime()
+                brTargeted[caster] = nil  -- released target after cast
+                BR_BroadcastCast(caster)
+                UpdateDruidAssignFrame()
+            end
+        end
+        -- fall through to resurrection check below
+    end
+
     -- Combat log resurrection messages
     local msg = arg1
     if not msg then return end
     local rezzed = nil
-    if string.find(msg, "^You have been resurrected") or string.find(msg, "^You are resurrected") then
+    -- WoW 1.12 resurrection messages
+    if string.find(msg, "^You have been resurrected") or
+       string.find(msg, "^You are resurrected") or
+       string.find(msg, "^You have been restored to life") then
         rezzed = UnitName("player")
     else
         local _,_,cap = string.find(msg, "^(.+) is resurrected")
         if not cap then _,_,cap = string.find(msg, "^(.+) comes back to life") end
+        if not cap then _,_,cap = string.find(msg, "^(.+) has been resurrected") end
         if cap then rezzed = cap end
     end
-    if rezzed then RemoveDeadHealer(rezzed) end
+    if rezzed then
+        RemoveDeadHealer(rezzed)
+        BR_RemoveDead(rezzed)
+        UpdateDruidAssignFrame()
+        UpdateAssignFrame()
+    end
 end)
 
 -------------------------------------------------------------------------------
@@ -3011,8 +3798,14 @@ eventFrame:SetScript("OnEvent",function()
             InitDB()
             if HealAssignDB.activeTemplate and HealAssignDB.templates[HealAssignDB.activeTemplate] then
                 currentTemplate = HealAssignDB.templates[HealAssignDB.activeTemplate]
-                if not currentTemplate.roster  then currentTemplate.roster  = {} end
-                if not currentTemplate.healers then currentTemplate.healers = {} end
+                if not currentTemplate.roster   then currentTemplate.roster   = {} end
+                if not currentTemplate.healers  then currentTemplate.healers  = {} end
+                -- Fix: convert false tags to nil (false is falsy in Lua tag checks)
+                for _,pdata in pairs(currentTemplate.roster) do
+                    if pdata.tagT == false then pdata.tagT = nil end
+                    if pdata.tagH == false then pdata.tagH = nil end
+                    if pdata.tagV == false then pdata.tagV = nil end
+                end
             end
             if not currentTemplate then currentTemplate = NewTemplate("") end
             if not currentTemplate.innervate then currentTemplate.innervate = {} end
@@ -3022,6 +3815,7 @@ eventFrame:SetScript("OnEvent",function()
             if GetNumRaidMembers() > 0 then
                 UpdateAssignFrame()
             end
+            CreateMinimapButton()
             DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffHealAssign|r v"..ADDON_VERSION.." loaded. |cffffffff/ha|r to open.")
         end
 
@@ -3029,43 +3823,32 @@ eventFrame:SetScript("OnEvent",function()
         HandleAddonMessage(arg1,arg2,arg3,arg4)
 
     elseif event == "PLAYER_ENTERING_WORLD" then
-        -- Broadcast my CD state so healer frames sync after reload
         if INN_BroadcastMyCD then INN_BroadcastMyCD() end
         UpdateAssignFrame()
         UpdateDruidAssignFrame()
 
     elseif event == "RAID_ROSTER_UPDATE" or event == "PARTY_MEMBERS_CHANGED" then
         local inRaid = GetNumRaidMembers() > 0
-        -- Only update assign frame based on raid status (not party)
-        if assignFrame then
-            if inRaid then
-                UpdateAssignFrame()
-                UpdateDruidAssignFrame()
-            else
-                local showOutside = HealAssignDB and HealAssignDB.options and HealAssignDB.options.showAssignFrame
-                if showOutside then
-                    UpdateAssignFrame()
-                else
-                    assignFrame:Hide()
-                end
-                -- FIX 4: always hide druid frame when leaving raid
-                if druidAssignFrame then druidAssignFrame:Hide() end
+        if inRaid then
+            HA_wasInRaid = true
+            HA_reloadProtect = false  -- raid confirmed, protection no longer needed
+            UpdateAssignFrame()
+            UpdateDruidAssignFrame()
+        else
+            local showOutside = HealAssignDB and HealAssignDB.options and HealAssignDB.options.showAssignFrame
+            if assignFrame then
+                if showOutside then UpdateAssignFrame()
+                else assignFrame:Hide() end
             end
+            if druidAssignFrame then druidAssignFrame:Hide() end
         end
         if inRaid then
             if mainFrame and mainFrame:IsShown() then RebuildMainGrid() end
             if rosterFrame and rosterFrame:IsShown() then RebuildRosterRows() end
             if rlFrame and rlFrame:IsShown() then UpdateRLFrame() end
         else
-            -- Left raid: close roster (stale data), keep main frame open
             if rosterFrame and rosterFrame:IsShown() then rosterFrame:Hide() end
             if rlFrame and rlFrame:IsShown() then rlFrame:Hide() end
-            -- FIX 5: clear runtime roster so stale members don't appear in new raid
-            if currentTemplate then
-                currentTemplate.roster    = {}
-                currentTemplate.healers   = {}
-                currentTemplate.innervate = {}
-            end
         end
     end
 end)
@@ -3279,6 +4062,7 @@ local function INN_RebuildAssignRows()
                 elseif item.hname then
                     tmpl.innervate[capturedDruid] = item.hname
                 end
+                            PersistTemplate()
                 INN_BroadcastAssignments()
                 INN_RebuildAssignRows()
                 UpdateAssignFrame()
@@ -3312,6 +4096,7 @@ end
 
 function CreateInnervateFrame()
     if innervateFrame then
+        innervateFrame:SetFrameStrata("HIGH")
         INN_RebuildAssignRows()
         innervateFrame:Raise()
         innervateFrame:Show()
@@ -3329,7 +4114,7 @@ function CreateInnervateFrame()
     innervateFrame:SetScript("OnDragStart",function() this:StartMoving() end)
     innervateFrame:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
     innervateFrame:SetFrameStrata("DIALOG")
-    innervateFrame:SetFrameLevel(10)
+    innervateFrame:SetFrameLevel(50)
     innervateFrame:SetBackdrop({
         bgFile  ="Interface\\DialogFrame\\UI-DialogBox-Background",
         edgeFile="Interface\\DialogFrame\\UI-DialogBox-Border",
@@ -3388,7 +4173,7 @@ innTicker:SetScript("OnUpdate",function()
     -- Update druid assign frame every tick (mana refresh + CD timer).
     local myPdata3 = tmpl.roster and tmpl.roster[myName]
     local amDruid = myPdata3 and myPdata3.class == "DRUID" and not myPdata3.tagH
-    if amDruid and tmpl.innervate and tmpl.innervate[myName] then
+    if amDruid and tmpl and tmpl.innervate and tmpl.innervate[myName] then
         UpdateDruidAssignFrame()
         -- BigWigs-style green alert when assigned healer drops below 50% mana.
         -- Alert fires only once per CD cycle: after casting Innervate the alert is
@@ -3477,4 +4262,5 @@ SlashCmdList["HEALASSIGN"] = function(msg)
             CreateMainFrame()
         end
     end
+
 end
