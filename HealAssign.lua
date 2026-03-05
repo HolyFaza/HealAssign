@@ -395,7 +395,7 @@ end
 local function BR_GetCDRemaining(druidName)
     -- Own CD: read directly from spell
     if druidName == UnitName("player") then
-        local cdStart, cdDur = GetSpellCooldown("Rebirth")
+        local cdStart, cdDur = GetSpellCooldown(20748)
         if cdStart and cdStart > 0 and cdDur and cdDur > 1.5 then
             local rem = (cdStart + cdDur) - GetTime()
             return rem > 0 and rem or 0
@@ -4262,5 +4262,6 @@ SlashCmdList["HEALASSIGN"] = function(msg)
             CreateMainFrame()
         end
     end
+
 
 end
