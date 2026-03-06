@@ -299,6 +299,8 @@ local function SyncHealersFromRoster(tmpl)
     if not tmpl.innervate then tmpl.innervate = {} end
 end
 
+local INN_CD_FULL   = 360   -- 6 min innervate CD
+local INN_ICON      = "Interface\\Icons\\Spell_Nature_Lightning"
 local innCD           = {}    -- [druidName] = GetTime() when cast
 local INN_ALERT_SHOWN = {}    -- [druidName] = true when alert shown
 
@@ -372,8 +374,6 @@ end
 -------------------------------------------------------------------------------
 -- INNERVATE RUNTIME STATE
 -------------------------------------------------------------------------------
-local INN_CD_FULL   = 1200  -- 20 min innervate CD
-local INN_ICON      = "Interface\\Icons\\Spell_Nature_Lightning"
 local innervateFrame = nil  -- assignment popup frame
 
 -------------------------------------------------------------------------------
@@ -393,20 +393,29 @@ local function BR_IsTH(name)
 end
 
 local function BR_GetCDRemaining(druidName)
-    -- Own CD: read directly from spell
-    if druidName == UnitName("player") then
-        local cdStart, cdDur = GetSpellCooldown(20748)
-        if cdStart and cdStart > 0 and cdDur and cdDur > 1.5 then
-            local rem = (cdStart + cdDur) - GetTime()
-            return rem > 0 and rem or 0
-        end
-        return 0
-    end
-    -- Others: from brCD table (set via combat log)
+    -- Use brCD table for everyone (set via combat log on cast)
     local t = brCD[druidName]
-    if not t then return 0 end
-    local rem = BR_CD_FULL - (GetTime() - t)
-    return rem > 0 and rem or 0
+    if t then
+        local rem = BR_CD_FULL - (GetTime() - t)
+        return rem > 0 and rem or 0
+    end
+    -- Fallback for self: read from spellbook (e.g. after /reload before any cast)
+    if druidName == UnitName("player") then
+        local slot
+        for i = 1, 200 do
+            local sName = GetSpellName(i, BOOKTYPE_SPELL)
+            if not sName then break end
+            if sName == "Rebirth" then slot = i end
+        end
+        if slot then
+            local cdStart, cdDur = GetSpellCooldown(slot, BOOKTYPE_SPELL)
+            if cdStart and cdStart > 0 and cdDur and cdDur > 1.5 then
+                local rem = (cdStart + cdDur) - GetTime()
+                return rem > 0 and rem or 0
+            end
+        end
+    end
+    return 0
 end
 
 local function BR_AddDead(name)
@@ -1149,29 +1158,104 @@ local function UpdateAssignFrame()
                     end
                 end
 
+                -- Three-column block for Rebirth rows:
+                -- col1=druid name, col2=CD timer, col3=dead target
+                local brCol1 = math.floor(innerW * 0.42)
+                local brCol2 = math.floor(innerW * 0.16)
+                local brCol3 = innerW - brCol1 - brCol2 - 2  -- 2 for dividers
+
+                local function RenderRebirthBlock(druidName, cdRem2, targetName, isClaimed, dr2,dg2,db2)
+                    local blockH = rowStep + 2
+                    local block = CreateFrame("Frame",nil,assignFrame)
+                    block:SetPoint("TOPLEFT", assignFrame,"TOPLEFT", PAD, yOff)
+                    block:SetWidth(innerW)
+                    block:SetHeight(blockH)
+                    block:SetBackdrop({
+                        bgFile   = "Interface\\Buttons\\WHITE8X8",
+                        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+                        tile=true, tileSize=8, edgeSize=8,
+                        insets={left=2,right=2,top=2,bottom=2}
+                    })
+                    block:SetBackdropColor(dr2*0.05, dg2*0.05, db2*0.05, 0.4)
+                    block:SetBackdropBorderColor(dr2*0.5, dg2*0.5, db2*0.5, 0.6)
+                    table.insert(assignFrame.content, block)
+
+                    -- Col 1: druid name
+                    local fsD = block:CreateFontString(nil,"OVERLAY")
+                    fsD:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
+                    fsD:SetPoint("TOPLEFT",block,"TOPLEFT",4,-2)
+                    fsD:SetWidth(brCol1 - 8)
+                    fsD:SetHeight(rowStep)
+                    fsD:SetJustifyH("LEFT")
+                    fsD:SetJustifyV("MIDDLE")
+                    fsD:SetTextColor(dr2,dg2,db2)
+                    fsD:SetText(druidName)
+
+                    -- Divider 1 (after col1)
+                    local vd1 = block:CreateTexture(nil,"ARTWORK")
+                    vd1:SetWidth(1)
+                    vd1:SetPoint("TOPLEFT",    block,"TOPLEFT",  brCol1, -2)
+                    vd1:SetPoint("BOTTOMLEFT", block,"BOTTOMLEFT",brCol1,  2)
+                    vd1:SetTexture(dr2*0.5, dg2*0.5, db2*0.5, 0.5)
+
+                    -- Col 2: CD timer
+                    local fsCD = block:CreateFontString(nil,"OVERLAY")
+                    fsCD:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
+                    fsCD:SetPoint("TOPLEFT",block,"TOPLEFT", brCol1+4, -2)
+                    fsCD:SetWidth(brCol2 - 8)
+                    fsCD:SetHeight(rowStep)
+                    fsCD:SetJustifyH("CENTER")
+                    fsCD:SetJustifyV("MIDDLE")
+                    if cdRem2 > 0 then
+                        local cdText
+                        if cdRem2 <= 90 then
+                            cdText = math.ceil(cdRem2).."s"
+                        else
+                            cdText = math.ceil(cdRem2/60).."m"
+                        end
+                        fsCD:SetTextColor(1,1,0)
+                        fsCD:SetText(cdText)
+                    else
+                        fsCD:SetText("")
+                    end
+
+                    -- Divider 2 (after col2)
+                    local vd2 = block:CreateTexture(nil,"ARTWORK")
+                    vd2:SetWidth(1)
+                    vd2:SetPoint("TOPLEFT",    block,"TOPLEFT",  brCol1+brCol2+1, -2)
+                    vd2:SetPoint("BOTTOMLEFT", block,"BOTTOMLEFT",brCol1+brCol2+1,  2)
+                    vd2:SetTexture(dr2*0.5, dg2*0.5, db2*0.5, 0.5)
+
+                    -- Col 3: dead target name
+                    local fsTgt = block:CreateFontString(nil,"OVERLAY")
+                    fsTgt:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
+                    fsTgt:SetPoint("TOPLEFT",block,"TOPLEFT", brCol1+brCol2+5, -2)
+                    fsTgt:SetWidth(brCol3 - 8)
+                    fsTgt:SetHeight(rowStep)
+                    fsTgt:SetJustifyH("LEFT")
+                    fsTgt:SetJustifyV("MIDDLE")
+                    if targetName then
+                        if isClaimed then
+                            fsTgt:SetTextColor(1,0.85,0.85)
+                        else
+                            fsTgt:SetTextColor(1,0.3,0.3)
+                            fsTgt:SetText("|cffff4444[!]|r "..targetName)
+                        end
+                        if isClaimed then fsTgt:SetText(targetName) end
+                    else
+                        fsTgt:SetText("")
+                    end
+
+                    yOff = yOff - blockH - 3
+                end
+
                 -- One row per druid
                 for _,dname in ipairs(brDruids) do
-                    local tgt    = druidTargets[dname]
-                    local cdRem  = BR_GetCDRemaining(dname)
+                    local tgt      = druidTargets[dname]
+                    local cdRem    = BR_GetCDRemaining(dname)
                     local dr,dg,db = GetClassColor("DRUID")
-                    local dDisp  = dname
-                    if cdRem > 0 then
-                        local bm = math.floor(cdRem/60)
-                        local bs = math.floor(math.mod(cdRem,60))
-                        dDisp = dname.." |cffffff00("..string.format("%d:%02d",bm,bs)..")|r"
-                    end
-                    local fakeM     = {display=dDisp, ttype="druid", tvalue=dname}
-                    local rightLabel
-                    if tgt then
-                        -- Check if this is claimed (druid clicked) or auto-assigned
-                        if brTargeted[dname] then
-                            rightLabel = tgt  -- claimed: normal color
-                        else
-                            rightLabel = "|cffff4444[!]|r "..tgt  -- auto-assigned: red alert
-                        end
-                    end
-                    local fakeHeals = rightLabel and {rightLabel} or {}
-                    RenderTargetBlock(fakeM, fakeHeals, dr,dg,db)
+                    local isClaimed = brTargeted[dname] ~= nil
+                    RenderRebirthBlock(dname, cdRem, tgt, isClaimed, dr,dg,db)
                 end
 
                 -- Dead with no druid available (more dead than druids)
@@ -1455,7 +1539,7 @@ local function UpdateAssignFrame()
             row:SetPoint("TOPLEFT",assignFrame,"TOPLEFT",PAD_H,yOff)
             row:SetWidth(aInnerW)
             row:SetHeight(aRowH)
-            row:EnableMouse(not takenBy)
+            row:EnableMouse(not takenBy and not isMine and brCDRem <= 0)
             row:SetBackdrop({
                 bgFile   = "Interface\\Buttons\\WHITE8X8",
                 edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
@@ -1489,21 +1573,16 @@ local function UpdateAssignFrame()
             icF:SetPoint("RIGHT",row,"RIGHT",-4,0)
             local icT = icF:CreateTexture(nil,"OVERLAY")
             icT:SetAllPoints(icF)
-            icT:SetTexture(BR_ICON)
-            if isMine then icT:SetVertexColor(1,0.85,0)     -- yellow: claimed by me
-            elseif takenBy then icT:SetVertexColor(1,0.2,0.2) -- red: claimed by other
-            else icT:SetVertexColor(0.3,1,0.3) end           -- green: free
-            if not takenBy then
+            icT:SetTexture("Interface\\Buttons\\WHITE8X8")
+            if isMine then icT:SetVertexColor(1, 0.85, 0)      -- yellow: claimed by me
+            elseif takenBy then icT:SetVertexColor(1, 0.2, 0.2) -- red: claimed by other
+            else icT:SetVertexColor(0.2, 1, 0.2) end             -- green: free
+            if not takenBy and not isMine and brCDRem <= 0 then
                 local capName = dname
                 row:SetScript("OnClick",function()
-                    if brTargeted[myName] == capName then
-                        brTargeted[myName] = nil
-                        BR_BroadcastTarget(myName, nil)
-                    else
-                        brTargeted[myName] = capName
-                        TargetByName(capName)
-                        BR_BroadcastTarget(myName, capName)
-                    end
+                    brTargeted[myName] = capName
+                    TargetByName(capName)
+                    BR_BroadcastTarget(myName, capName)
                     UpdateAssignFrame()
                 end)
             end
@@ -1960,7 +2039,7 @@ local function UpdateDruidAssignFrame()
         row:SetPoint("TOPLEFT",druidAssignFrame,"TOPLEFT",PAD,curY)
         row:SetWidth(innerW)
         row:SetHeight(rowH2)
-        row:EnableMouse(not takenBy)
+        row:EnableMouse(not takenBy and not isMine and brCDRem <= 0)
         row:SetBackdrop({
             bgFile   = "Interface\\Buttons\\WHITE8X8",
             edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
@@ -1996,33 +2075,28 @@ local function UpdateDruidAssignFrame()
         end
         if not takenBy then fs:SetText(dname) end
 
-        -- Status icon (BR icon right side)
+        -- Status indicator: colored square (right side)
         local icF = CreateFrame("Frame",nil,row)
         icF:SetWidth(iconSzSm) icF:SetHeight(iconSzSm)
         icF:SetPoint("RIGHT",row,"RIGHT",-4,0)
         local icT = icF:CreateTexture(nil,"OVERLAY")
         icT:SetAllPoints(icF)
-        icT:SetTexture(BR_ICON)
+        icT:SetTexture("Interface\\Buttons\\WHITE8X8")
         if isMine then
-            icT:SetVertexColor(1,0.85,0)    -- yellow: claimed by me
+            icT:SetVertexColor(1, 0.85, 0)      -- yellow: claimed by me
         elseif takenBy then
-            icT:SetVertexColor(1,0.2,0.2)   -- red: claimed by other druid
+            icT:SetVertexColor(1, 0.2, 0.2)     -- red: claimed by other druid
         else
-            icT:SetVertexColor(0.3,1,0.3)   -- green: free
+            icT:SetVertexColor(0.2, 1, 0.2)     -- green: free
         end
 
-        -- Click: claim/unclaim
-        if not takenBy then
+        -- Click: claim target (no unclaim on second click - use ESC to drop target)
+        if not takenBy and not isMine and brCDRem <= 0 then
             local capName = dname
             row:SetScript("OnClick",function()
-                if brTargeted[myName2] == capName then
-                    brTargeted[myName2] = nil
-                    BR_BroadcastTarget(myName2, nil)
-                else
-                    brTargeted[myName2] = capName
-                    TargetByName(capName)
-                    BR_BroadcastTarget(myName2, capName)
-                end
+                brTargeted[myName2] = capName
+                TargetByName(capName)
+                BR_BroadcastTarget(myName2, capName)
                 UpdateDruidAssignFrame()
             end)
         end
@@ -4173,8 +4247,11 @@ innTicker:SetScript("OnUpdate",function()
     -- Update druid assign frame every tick (mana refresh + CD timer).
     local myPdata3 = tmpl.roster and tmpl.roster[myName]
     local amDruid = myPdata3 and myPdata3.class == "DRUID" and not myPdata3.tagH
-    if amDruid and tmpl and tmpl.innervate and tmpl.innervate[myName] then
+    if amDruid then
+        -- Always update druid frame (covers both innervate mana display and rebirth CD)
         UpdateDruidAssignFrame()
+    end
+    if amDruid and tmpl.innervate and tmpl.innervate[myName] then
         -- BigWigs-style green alert when assigned healer drops below 50% mana.
         -- Alert fires only once per CD cycle: after casting Innervate the alert is
         -- suppressed for the entire cooldown duration, then resets when CD expires.
@@ -4186,7 +4263,14 @@ innTicker:SetScript("OnUpdate",function()
             INN_ALERT_SHOWN[myName] = true
         else
             -- CD is ready: allow alert to fire when healer falls below 50%
-            if mPct and mPct < 50 then
+            -- but only if the healer is alive
+            local healerDead = false
+            for _,dd in ipairs(deadHealers) do
+                if dd.name == assignedH then healerDead = true break end
+            end
+            if healerDead then
+                INN_ALERT_SHOWN[myName] = true  -- suppress until healer is alive again
+            elseif mPct and mPct < 50 then
                 if not INN_ALERT_SHOWN[myName] then
                     INN_ALERT_SHOWN[myName] = true
                     INN_ShowAlert(assignedH, mPct)
@@ -4195,6 +4279,34 @@ innTicker:SetScript("OnUpdate",function()
                 -- Healer recovered above 60%: reset flag so next drop triggers again
                 INN_ALERT_SHOWN[myName] = nil
             end
+        end
+    end
+
+    -- Auto-sync brTargeted with real in-game target for self.
+    -- If the druid manually changed/dropped target outside the frame - reset claim.
+    if amDruid and brTargeted[myName] then
+        local realTarget = UnitName("target")
+        if realTarget ~= brTargeted[myName] then
+            brTargeted[myName] = nil
+            BR_BroadcastTarget(myName, nil)
+            UpdateDruidAssignFrame()
+            if assignFrame and assignFrame:IsShown() then UpdateAssignFrame() end
+        end
+    end
+
+    -- Update viewer assignFrame if open: always refresh when brTargeted has entries
+    -- or there are active rebirth CDs (covers target claim/unclaim and CD countdown)
+    local myPdata4 = tmpl.roster and tmpl.roster[myName]
+    if myPdata4 and myPdata4.tagV then
+        local needsUpdate = false
+        if next(brTargeted) then needsUpdate = true end
+        if not needsUpdate then
+            for dname,_ in pairs(tmpl.roster) do
+                if BR_GetCDRemaining(dname) > 0 then needsUpdate = true break end
+            end
+        end
+        if needsUpdate and assignFrame and assignFrame:IsShown() then
+            UpdateAssignFrame()
         end
     end
     -- Update innervate assignment window if open
