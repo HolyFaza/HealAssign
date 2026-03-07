@@ -41,10 +41,15 @@ Designed for raid leaders and healers to manage and display healing assignments 
 - Dead healers shown in **red**
 - Receives death alerts and audio notification
 
-### Battle Rez (Druid)
-- Raid leader assigns each druid a **Battle Rez target** (any raid member)
-- Druids receive a dedicated window showing their assigned target
-- Battle Rez cooldown timer displayed on the icon
+### Rebirth (Druid)
+- All druids receive a dedicated **Rebirth** window with a live list of dead T/H-tagged raid members
+- Click a name in the list to target that player, then press the **Rebirth** cast button
+- Target status is synced across all druids in real time:
+  - 🟢 Green — not targeted by any druid
+  - 🟡 Yellow — targeted by you
+  - 🔴 Red — targeted by another druid
+- Rebirth icon shows the remaining **30-minute cooldown** timer
+- Healer-druids see the Rebirth section integrated into their existing assignment window
 
 ### Options
 - Font size for the assignment window (8–24)
@@ -96,7 +101,7 @@ Designed for raid leaders and healers to manage and display healing assignments 
 ## Changelog
 
 ### v2.0.4
-- **Battle Rez assignment system** — raid leader assigns each druid a Battle Rez target; druids receive a dedicated window with their assigned target and cooldown timer
+- **Rebirth system** — all druids receive a window with a live list of dead T/H-tagged raid members; click a name to target, then cast Rebirth via the cast button; target status is synced across all druids in real time (green = free, yellow = your target, red = taken); 30-minute cooldown timer shown on the icon; healer-druids see Rebirth integrated into their assignment window
 - **Minimap icon** — addon now shows a draggable icon on the minimap; click to toggle the main window; drag to reposition
 - **Hide in Battlegrounds** — new checkbox in Options; when enabled (default), the addon is hidden in battlegrounds
 
