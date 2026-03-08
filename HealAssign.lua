@@ -8,6 +8,8 @@
 local ADDON_NAME    = "HealAssign"
 local ADDON_VERSION = "2.0.4"
 local COMM_PREFIX   = "HealAssign"
+local HA_editorOpenBy   = nil   -- name of player who has mainFrame open
+local HA_editorOpenTime = nil   -- GetTime() when HA_OPEN was received
 
 local CLASS_COLORS = {
     ["WARRIOR"] = {r=0.78,g=0.61,b=0.43},
@@ -378,11 +380,35 @@ local innervateFrame = nil  -- assignment popup frame
 local viewerFrame    = nil  -- viewer (V tag) overview window
 
 -------------------------------------------------------------------------------
+-- TEXT MEASUREMENT UTILITY
+-- One hidden fontstring used to measure text width accurately
+-------------------------------------------------------------------------------
+-- Text width estimation for FRIZQT__.TTF in WoW 1.12.1
+-- Coefficient calibrated for 12-char names (max WoW name length)
+local _charWidthCoeff = 0.50  -- adjusted empirically
+local _measureDebugDone = false
+local function HA_MeasureText(text, fontSize)
+    return string.len(text) * fontSize * _charWidthCoeff
+end
+
+-- Returns pixel width of the longest name in roster at given fontSize
+local function HA_MaxNameWidth(tmpl, fontSize)
+    local maxW = HA_MeasureText("Abcde", fontSize)  -- minimum ~5 char fallback
+    if tmpl and tmpl.roster then
+        for pname,_ in pairs(tmpl.roster) do
+            local w = HA_MeasureText(pname, fontSize)
+            if w > maxW then maxW = w end
+        end
+    end
+    return maxW
+end
+
+-------------------------------------------------------------------------------
 -- REBIRTH SYSTEM UTILITIES
 -------------------------------------------------------------------------------
 local BR_CD_FULL    = 1800  -- 30 min in vanilla
 local BR_ICON       = "Interface\\Icons\\Spell_Nature_Reincarnation"
-local brDeadList    = {}    -- [{name, time}] мёртвые T/H для BR
+local brDeadList    = {}    -- [{name, time}] dead T/H players for Rebirth tracking
 local brTargeted    = {}    -- [druidName] = targetName
 local brCD          = {}    -- [druidName] = castTime
 
@@ -745,13 +771,14 @@ end
 
 local function RefreshAlertFrame()
     if not alertFrame then return end
+    -- Only hide the alert banner after 15s; do NOT remove from deadHealers
+    -- Removal from deadHealers happens only via RemoveDeadHealer() on actual resurrection
     local now = GetTime()
-    local alive = {}
+    local anyRecent = false
     for _,d in ipairs(deadHealers) do
-        if now - d.time < 15 then table.insert(alive,d) end
+        if now - d.time < 15 then anyRecent = true break end
     end
-    deadHealers = alive
-    if table.getn(deadHealers) == 0 then
+    if not anyRecent then
         alertFrame:Hide()
     end
 end
@@ -808,9 +835,135 @@ end
 
 -------------------------------------------------------------------------------
 -- VIEWER FRAME (V tag: overview of all assignments + rebirth)
+-- Widget pool: frames are created once; on each update only text/color/position/
+-- visibility changes. CreateFrame/CreateFontString are NOT called on every update
+-- eliminating memory leaks and frame rate drops.
 -------------------------------------------------------------------------------
+
+-- Header pool: frame + fontstring
+local VF_HDR_POOL = {}
+local VF_HDR_MAX  = 10
+
+-- Assignment block pool (TargetBlock): frame + fsTarget + vdiv + up to 10 healer rows
+local VF_BLK_POOL = {}
+local VF_BLK_MAX  = 40  -- max target->healers blocks per render
+
+-- Healer rows inside each block (up to 10 healers per target x 40 blocks,
+-- stored per-block as blk.healRows)
+local VF_HEAL_PER_BLK = 10
+
+-- Rebirth block pool
+local VF_RBK_POOL = {}
+local VF_RBK_MAX  = 20
+
+-- Active element counters for current render
+local vfHdrUsed = 0
+local vfBlkUsed = 0
+local vfRbkUsed = 0
+
+-- Single fontstrings for "no assignments" / "no druids" messages
+local vfNoAssignFS = nil
+local vfNoDruidsFS = nil
+
+local function VF_EnsurePools(fontSize)
+    -- Create headers
+    while table.getn(VF_HDR_POOL) < VF_HDR_MAX do
+        local hdr = CreateFrame("Frame", nil, viewerFrame)
+        hdr:SetBackdrop({bgFile="Interface\\Buttons\\WHITE8X8",
+            insets={left=0,right=0,top=0,bottom=0}})
+        hdr:Hide()
+        local fs = hdr:CreateFontString(nil,"OVERLAY")
+        fs:SetFont("Fonts\\FRIZQT__.TTF", fontSize, "OUTLINE")
+        fs:SetPoint("LEFT",  hdr, "LEFT",  0, 0)
+        fs:SetPoint("RIGHT", hdr, "RIGHT", 0, 0)
+        fs:SetJustifyH("CENTER")
+        hdr.fs = fs
+        table.insert(VF_HDR_POOL, hdr)
+    end
+
+    -- Create assignment blocks
+    while table.getn(VF_BLK_POOL) < VF_BLK_MAX do
+        local blk = CreateFrame("Frame", nil, viewerFrame)
+        blk:SetBackdrop({
+            bgFile   = "Interface\\Buttons\\WHITE8X8",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile=true, tileSize=8, edgeSize=8,
+            insets={left=2,right=2,top=2,bottom=2}
+        })
+        blk:Hide()
+        local fsT = blk:CreateFontString(nil,"OVERLAY")
+        fsT:SetJustifyH("LEFT")
+        fsT:SetJustifyV("MIDDLE")
+        blk.fsTarget = fsT
+        local vdiv = blk:CreateTexture(nil,"ARTWORK")
+        vdiv:SetWidth(1)
+        blk.vdiv = vdiv
+        blk.healRows = {}
+        for i = 1, VF_HEAL_PER_BLK do
+            local fh = blk:CreateFontString(nil,"OVERLAY")
+            fh:SetJustifyH("LEFT")
+            fh:SetJustifyV("MIDDLE")
+            fh:Hide()
+            local sep = blk:CreateTexture(nil,"ARTWORK")
+            sep:SetHeight(1)
+            sep:Hide()
+            table.insert(blk.healRows, {fs=fh, sep=sep})
+        end
+        table.insert(VF_BLK_POOL, blk)
+    end
+
+    -- Create Rebirth blocks
+    while table.getn(VF_RBK_POOL) < VF_RBK_MAX do
+        local blk = CreateFrame("Frame", nil, viewerFrame)
+        blk:SetBackdrop({
+            bgFile   = "Interface\\Buttons\\WHITE8X8",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile=true, tileSize=8, edgeSize=8,
+            insets={left=2,right=2,top=2,bottom=2}
+        })
+        blk:Hide()
+        local fsD  = blk:CreateFontString(nil,"OVERLAY")
+        fsD:SetJustifyH("LEFT") fsD:SetJustifyV("MIDDLE")
+        local vd1  = blk:CreateTexture(nil,"ARTWORK") vd1:SetWidth(1)
+        local fsCD = blk:CreateFontString(nil,"OVERLAY")
+        fsCD:SetJustifyH("CENTER") fsCD:SetJustifyV("MIDDLE")
+        local vd2  = blk:CreateTexture(nil,"ARTWORK") vd2:SetWidth(1)
+        local fsTgt= blk:CreateFontString(nil,"OVERLAY")
+        fsTgt:SetJustifyH("LEFT") fsTgt:SetJustifyV("MIDDLE")
+        blk.fsD = fsD blk.vd1 = vd1 blk.fsCD = fsCD
+        blk.vd2 = vd2 blk.fsTgt = fsTgt
+        table.insert(VF_RBK_POOL, blk)
+    end
+
+    -- Single empty-state strings
+    if not vfNoAssignFS then
+        vfNoAssignFS = viewerFrame:CreateFontString(nil,"OVERLAY")
+        vfNoAssignFS:Hide()
+    end
+    if not vfNoDruidsFS then
+        vfNoDruidsFS = viewerFrame:CreateFontString(nil,"OVERLAY")
+        vfNoDruidsFS:Hide()
+    end
+end
+
+-- Hide all pool elements
+local function VF_HideAll()
+    for _,h in ipairs(VF_HDR_POOL) do h:Hide() end
+    for _,b in ipairs(VF_BLK_POOL) do
+        b:Hide()
+        for _,r in ipairs(b.healRows) do r.fs:Hide() r.sep:Hide() end
+    end
+    for _,b in ipairs(VF_RBK_POOL) do b:Hide() end
+    if vfNoAssignFS then vfNoAssignFS:Hide() end
+    if vfNoDruidsFS then vfNoDruidsFS:Hide() end
+    if viewerFrame and viewerFrame._brToggleBtn then viewerFrame._brToggleBtn:Hide() end
+    vfHdrUsed = 0
+    vfBlkUsed = 0
+    vfRbkUsed = 0
+end
+
 local function UpdateViewerFrame()
-    -- Create viewerFrame if needed
+    -- Create viewerFrame once
     if not viewerFrame then
         viewerFrame = CreateFrame("Frame","HealAssignViewerFrame",UIParent)
         viewerFrame:SetWidth(220)
@@ -838,131 +991,164 @@ local function UpdateViewerFrame()
         local _alpha = (HealAssignDB and HealAssignDB.options and HealAssignDB.options.windowAlpha) or 0.95
         viewerFrame:SetBackdropColor(0.05,0.05,0.1,_alpha)
         viewerFrame:SetBackdropBorderColor(0.3,0.6,1,0.8)
-        viewerFrame.content = {}
         viewerFrame:Hide()
-        local optBtn = CreateFrame("Button",nil,viewerFrame,"UIPanelButtonTemplate")
-        optBtn:SetWidth(24) optBtn:SetHeight(16)
-        optBtn:SetPoint("TOPRIGHT",viewerFrame,"TOPRIGHT",-4,-4)
-        optBtn:SetText("O")
-        optBtn:SetScript("OnClick",function()
-            if optionsFrame and optionsFrame:IsShown() then optionsFrame:Hide()
-            else HealAssign_OpenOptions() end
+        -- Window title (created once)
+        viewerFrame.titleFS = viewerFrame:CreateFontString(nil,"OVERLAY","GameFontNormal")
+        viewerFrame.titleFS:SetPoint("TOP",viewerFrame,"TOP",0,-3)
+        viewerFrame.titleFS:SetTextColor(1,0.82,0.0)
+        viewerFrame.titleFS:SetText("Assignments")
+        -- Rebirth collapsed state (persists between updates)
+        viewerFrame._brCollapsed = false
+        -- Rebirth toggle button (created once, repositioned each render)
+        local brToggle = CreateFrame("Button",nil,viewerFrame,"UIPanelButtonTemplate")
+        brToggle:SetWidth(18) brToggle:SetHeight(14)
+        brToggle:SetText("+")
+        brToggle:Hide()
+        brToggle:SetScript("OnClick",function()
+            viewerFrame._brCollapsed = not viewerFrame._brCollapsed
+            UpdateViewerFrame()
         end)
+        viewerFrame._brToggleBtn = brToggle
     end
-
-    for _,c in ipairs(viewerFrame.content or {}) do c:Hide() end
-    viewerFrame.content = {}
 
     local inRaid = GetNumRaidMembers() > 0
     local showOutsideRaid = HealAssignDB and HealAssignDB.options and HealAssignDB.options.showAssignFrame
-    if not inRaid and not showOutsideRaid then viewerFrame:Hide() return end
-    if not HA_ShouldShow() then viewerFrame:Hide() return end
+    if not inRaid and not showOutsideRaid then
+        VF_HideAll()
+        viewerFrame:Hide()
+        return
+    end
+    if not HA_ShouldShow() then
+        VF_HideAll()
+        viewerFrame:Hide()
+        return
+    end
 
     local myName   = UnitName("player")
     local tmpl     = GetActiveTemplate()
     local fontSize = (HealAssignDB.options and HealAssignDB.options.fontSize) or 12
 
     local myPdata = tmpl and tmpl.roster and tmpl.roster[myName]
-    if not myPdata or not myPdata.tagV then viewerFrame:Hide() return end
+    if not myPdata or not myPdata.tagV then
+        VF_HideAll()
+        viewerFrame:Hide()
+        return
+    end
 
-    local frameW = math.max(200, math.min(380, fontSize * 18))
+    -- Frame width based on actual measured text width of longest name
+    local nameW   = HA_MaxNameWidth(tmpl, fontSize)
+    local colMinW = math.floor(nameW) + 16   -- one name column
+    local brCD_W  = math.floor(fontSize * 2.2) + 4
+    local twoColW   = colMinW * 2 + 10
+    local threeColW = colMinW + brCD_W + colMinW + 14
+    local frameW    = math.max(160, math.max(twoColW, threeColW))
     viewerFrame:SetWidth(frameW)
 
     local rowH    = fontSize + 4
     local rowStep = fontSize + 5
     local titleH  = fontSize + 8
     local yOff    = -(titleH + 2)
+    local PAD     = 6
+    local innerW  = frameW - PAD*2
+    local colL    = colMinW  -- left column = exactly one name width
+    local colR    = innerW - colL - 1
 
-    local PAD    = 6
-    local innerW = frameW - PAD*2
-    local colL   = math.floor(innerW * 0.44)
-    local colR   = innerW - colL - 1
+    -- Initialize pools if needed (first call or viewerFrame just created)
+    VF_EnsurePools(fontSize)
+    -- Hide all pool elements before render
+    VF_HideAll()
 
-    local titleFS = viewerFrame:CreateFontString(nil,"OVERLAY","GameFontNormal")
-    titleFS:SetPoint("TOP",viewerFrame,"TOP",0,-3)
-    titleFS:SetTextColor(1,0.82,0.0)
-    titleFS:SetText("Assignments")
-    table.insert(viewerFrame.content,titleFS)
+    -- Window title already created, just update font
+    viewerFrame.titleFS:SetFont("Fonts\\FRIZQT__.TTF", fontSize, "")
+    viewerFrame.titleFS:SetWidth(frameW - 32)  -- leave room for Options button
+    viewerFrame.titleFS:Show()
 
-    local function AddHeader(text, r,g,b, bgMul)
+    -- Helper: get header from pool
+    local function UseHeader(text, r,g,b, bgMul)
         bgMul = bgMul or 0.18
-        local hdr = CreateFrame("Frame",nil,viewerFrame)
+        vfHdrUsed = vfHdrUsed + 1
+        local hdr = VF_HDR_POOL[vfHdrUsed]
+        if not hdr then return end  -- pool exhausted
+        hdr:ClearAllPoints()
         hdr:SetPoint("TOPLEFT", viewerFrame,"TOPLEFT", PAD, yOff)
         hdr:SetWidth(innerW)
         hdr:SetHeight(rowH + 2)
-        hdr:SetBackdrop({bgFile="Interface\\Buttons\\WHITE8X8",
-            insets={left=0,right=0,top=0,bottom=0}})
         hdr:SetBackdropColor(r*bgMul, g*bgMul, b*bgMul, 0.7)
-        table.insert(viewerFrame.content, hdr)
-        local fs = hdr:CreateFontString(nil,"OVERLAY")
-        fs:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"OUTLINE")
-        fs:SetPoint("LEFT", hdr,"LEFT",  0, 0)
-        fs:SetPoint("RIGHT",hdr,"RIGHT", 0, 0)
-        fs:SetJustifyH("CENTER")
-        fs:SetTextColor(r,g,b)
-        fs:SetText(text)
+        hdr.fs:SetFont("Fonts\\FRIZQT__.TTF", fontSize, "OUTLINE")
+        hdr.fs:SetTextColor(r,g,b)
+        hdr.fs:SetText(text)
+        hdr:Show()
         yOff = yOff - (rowH + 4)
     end
 
-    local function RenderTargetBlock(m, heals, tcR,tcG,tcB)
+    -- Helper: get assignment block from pool
+    local function UseTargetBlock(m, heals, tcR,tcG,tcB)
         local numRows = table.getn(heals)
         if numRows == 0 then numRows = 1 end
         local blockH = rowStep * numRows + 2
-        local block = CreateFrame("Frame",nil,viewerFrame)
-        block:SetPoint("TOPLEFT", viewerFrame,"TOPLEFT", PAD, yOff)
-        block:SetWidth(innerW)
-        block:SetHeight(blockH)
-        block:SetBackdrop({
-            bgFile   = "Interface\\Buttons\\WHITE8X8",
-            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-            tile=true, tileSize=8, edgeSize=8,
-            insets={left=2,right=2,top=2,bottom=2}
-        })
-        block:SetBackdropColor(tcR*0.05, tcG*0.05, tcB*0.05, 0.4)
-        block:SetBackdropBorderColor(tcR*0.5, tcG*0.5, tcB*0.5, 0.6)
-        table.insert(viewerFrame.content, block)
-        local fsTarget = block:CreateFontString(nil,"OVERLAY")
-        fsTarget:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
-        fsTarget:SetPoint("TOPLEFT",block,"TOPLEFT",4,-2)
-        fsTarget:SetWidth(colL - 8)
-        fsTarget:SetHeight(rowStep)
-        fsTarget:SetJustifyH("LEFT")
-        fsTarget:SetJustifyV("MIDDLE")
-        fsTarget:SetTextColor(tcR,tcG,tcB)
-        fsTarget:SetText(m.display)
-        local vdiv = block:CreateTexture(nil,"ARTWORK")
-        vdiv:SetWidth(1)
-        vdiv:SetPoint("TOPLEFT",    block,"TOPLEFT",  colL, -2)
-        vdiv:SetPoint("BOTTOMLEFT", block,"BOTTOMLEFT",colL,  2)
-        vdiv:SetTexture(tcR*0.5, tcG*0.5, tcB*0.5, 0.5)
-        for hi,hname in ipairs(heals) do
-            local hr2,hg2,hb2 = 1,1,1
-            if tmpl.roster and tmpl.roster[hname] then
-                hr2,hg2,hb2 = GetClassColor(tmpl.roster[hname].class)
-            end
-            local isDead = false
-            for _,dd in ipairs(deadHealers) do
-                if dd.name == hname then isDead=true break end
-            end
-            if isDead then hr2,hg2,hb2 = 1,0.15,0.15 end
-            local fsH = block:CreateFontString(nil,"OVERLAY")
-            fsH:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
-            fsH:SetPoint("TOPLEFT",block,"TOPLEFT", colL+4, -(2 + (hi-1)*rowStep))
-            fsH:SetWidth(colR - 8)
-            fsH:SetHeight(rowStep)
-            fsH:SetJustifyH("LEFT")
-            fsH:SetJustifyV("MIDDLE")
-            fsH:SetTextColor(hr2,hg2,hb2)
-            local healText = isDead and (hname.." [dead]") or hname
-            fsH:SetText(healText)
-            if hi < numRows then
-                local hsep = block:CreateTexture(nil,"ARTWORK")
-                hsep:SetHeight(1)
-                hsep:SetPoint("TOPLEFT",  block,"TOPLEFT",  colL+2,  -(2 + hi*rowStep))
-                hsep:SetPoint("TOPRIGHT", block,"TOPRIGHT", -2,      -(2 + hi*rowStep))
-                hsep:SetTexture(0.3,0.3,0.3,0.3)
+        vfBlkUsed = vfBlkUsed + 1
+        local blk = VF_BLK_POOL[vfBlkUsed]
+        if not blk then return end  -- pool exhausted
+        blk:ClearAllPoints()
+        blk:SetPoint("TOPLEFT", viewerFrame,"TOPLEFT", PAD, yOff)
+        blk:SetWidth(innerW)
+        blk:SetHeight(blockH)
+        blk:SetBackdropColor(tcR*0.05, tcG*0.05, tcB*0.05, 0.4)
+        blk:SetBackdropBorderColor(tcR*0.5, tcG*0.5, tcB*0.5, 0.6)
+        -- Target label
+        blk.fsTarget:ClearAllPoints()
+        blk.fsTarget:SetFont("Fonts\\FRIZQT__.TTF", fontSize, "")
+        blk.fsTarget:SetPoint("TOPLEFT",blk,"TOPLEFT",4,-2)
+        blk.fsTarget:SetWidth(colL - 8)
+        blk.fsTarget:SetHeight(rowStep)
+        blk.fsTarget:SetTextColor(tcR,tcG,tcB)
+        blk.fsTarget:SetText(m.display)
+        -- Vertical divider
+        blk.vdiv:ClearAllPoints()
+        blk.vdiv:SetPoint("TOPLEFT",    blk,"TOPLEFT",   colL, -2)
+        blk.vdiv:SetPoint("BOTTOMLEFT", blk,"BOTTOMLEFT", colL,  2)
+        blk.vdiv:SetTexture(tcR*0.5, tcG*0.5, tcB*0.5, 0.5)
+        blk.vdiv:Show()
+        -- Healer rows
+        for i = 1, VF_HEAL_PER_BLK do
+            local row = blk.healRows[i]
+            if i <= numRows then
+                local hname = heals[i]
+                local hr2,hg2,hb2 = 1,1,1
+                if hname and tmpl and tmpl.roster and tmpl.roster[hname] then
+                    hr2,hg2,hb2 = GetClassColor(tmpl.roster[hname].class)
+                end
+                local isDead = false
+                if hname then
+                    for _,dd in ipairs(deadHealers) do
+                        if dd.name == hname then isDead=true break end
+                    end
+                end
+                if isDead then hr2,hg2,hb2 = 1,0.15,0.15 end
+                row.fs:ClearAllPoints()
+                row.fs:SetFont("Fonts\\FRIZQT__.TTF", fontSize, "")
+                row.fs:SetPoint("TOPLEFT",blk,"TOPLEFT", colL+4, -(2 + (i-1)*rowStep))
+                row.fs:SetWidth(colR - 8)
+                row.fs:SetHeight(rowStep)
+                row.fs:SetTextColor(hr2,hg2,hb2)
+                local healText = hname or ""
+                row.fs:SetText(healText)
+                row.fs:Show()
+                if i < numRows then
+                    row.sep:ClearAllPoints()
+                    row.sep:SetPoint("TOPLEFT",  blk,"TOPLEFT",  colL+2, -(2 + i*rowStep))
+                    row.sep:SetPoint("TOPRIGHT", blk,"TOPRIGHT", -2,     -(2 + i*rowStep))
+                    row.sep:SetTexture(0.3,0.3,0.3,0.3)
+                    row.sep:Show()
+                else
+                    row.sep:Hide()
+                end
+            else
+                row.fs:Hide()
+                row.sep:Hide()
             end
         end
+        blk:Show()
         yOff = yOff - blockH - 3
     end
 
@@ -999,49 +1185,48 @@ local function UpdateViewerFrame()
     end)
     table.sort(customTargets2, function(a,b) return targetMeta2[a].display < targetMeta2[b].display end)
 
-    AddHeader("Heal Assignments", 1,0.8,0.2, 0.22)
+    UseHeader("Heal Assignments", 1,0.8,0.2, 0.22)
 
     if table.getn(tankTargets2) > 0 then
         yOff = yOff - 2
-        AddHeader("Tanks", 0.78,0.61,0.43, 0.15)
+        UseHeader("Tanks", 0.78,0.61,0.43, 0.15)
         for _,key in ipairs(tankTargets2) do
             local m = targetMeta2[key]
             local tcR,tcG,tcB = 0.78,0.61,0.43
             if tmpl.roster and tmpl.roster[m.tvalue] then
                 tcR,tcG,tcB = GetClassColor(tmpl.roster[m.tvalue].class)
             end
-            RenderTargetBlock(m, targetHeals2[key], tcR,tcG,tcB)
+            UseTargetBlock(m, targetHeals2[key], tcR,tcG,tcB)
         end
     end
     if table.getn(groupTargets2) > 0 then
         yOff = yOff - 2
-        AddHeader("Groups", 0.5,0.85,1.0, 0.12)
+        UseHeader("Groups", 0.5,0.85,1.0, 0.12)
         for _,key in ipairs(groupTargets2) do
-            local m = targetMeta2[key]
-            RenderTargetBlock(m, targetHeals2[key], 0.5,0.85,1.0)
+            UseTargetBlock(targetMeta2[key], targetHeals2[key], 0.5,0.85,1.0)
         end
     end
     if table.getn(customTargets2) > 0 then
         yOff = yOff - 2
-        AddHeader("Custom", 0.9,0.6,1.0, 0.12)
+        UseHeader("Custom", 0.9,0.6,1.0, 0.12)
         for _,key in ipairs(customTargets2) do
-            local m = targetMeta2[key]
-            RenderTargetBlock(m, targetHeals2[key], 0.9,0.6,1.0)
+            UseTargetBlock(targetMeta2[key], targetHeals2[key], 0.9,0.6,1.0)
         end
     end
     if table.getn(tankTargets2)==0 and table.getn(groupTargets2)==0 and table.getn(customTargets2)==0 then
-        local noFs = viewerFrame:CreateFontString(nil,"OVERLAY")
-        noFs:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
-        noFs:SetPoint("TOPLEFT",viewerFrame,"TOPLEFT",PAD+4,yOff)
-        noFs:SetTextColor(0.5,0.5,0.5)
-        noFs:SetText("(no assignments)")
-        table.insert(viewerFrame.content,noFs)
+        vfNoAssignFS:ClearAllPoints()
+        vfNoAssignFS:SetFont("Fonts\\FRIZQT__.TTF", fontSize, "")
+        vfNoAssignFS:SetPoint("TOPLEFT",viewerFrame,"TOPLEFT",PAD+4,yOff)
+        vfNoAssignFS:SetTextColor(0.5,0.5,0.5)
+        vfNoAssignFS:SetText("(no assignments)")
+        vfNoAssignFS:Show()
         yOff = yOff - rowStep
     end
 
+    -- Innervate section
     if tmpl.innervate and next(tmpl.innervate) then
         yOff = yOff - 2
-        AddHeader("Innervate", 1,0.65,0.1, 0.15)
+        UseHeader("Innervate", 1,0.65,0.1, 0.15)
         local innList2 = {}
         for dn,hn in pairs(tmpl.innervate) do
             table.insert(innList2, {druid=dn, healer=hn})
@@ -1050,130 +1235,138 @@ local function UpdateViewerFrame()
         for _,pair in ipairs(innList2) do
             local vdr,vdg,vdb = GetClassColor("DRUID")
             local fakeM = {display=pair.druid, ttype="druid", tvalue=pair.druid}
-            RenderTargetBlock(fakeM, {pair.healer}, vdr,vdg,vdb)
+            UseTargetBlock(fakeM, {pair.healer}, vdr,vdg,vdb)
         end
     end
 
     -- Rebirth section
     do
         yOff = yOff - 4
-        AddHeader("Rebirth", 0.7,0.3,1, 0.15)
+        local collapsed = viewerFrame._brCollapsed
+        local brLabel = collapsed and "> Rebirth" or "v Rebirth"
+        UseHeader(brLabel, 0.7,0.3,1, 0.15)
+
+        -- Position toggle button on top of the Rebirth header
+        local btn = viewerFrame._brToggleBtn
+        local hdr = VF_HDR_POOL[vfHdrUsed]  -- the header just placed by UseHeader
+        if hdr then
+            btn:ClearAllPoints()
+            btn:SetPoint("RIGHT", hdr, "RIGHT", -2, 0)
+            btn:SetText(collapsed and "+" or "-")
+            btn:Show()
+        end
+
         local brDruids = {}
         if tmpl.roster then
             for pname,pd in pairs(tmpl.roster) do
-                if pd.class == "DRUID" then
-                    table.insert(brDruids, pname)
-                end
+                if pd.class == "DRUID" then table.insert(brDruids, pname) end
             end
         end
         table.sort(brDruids)
-        if table.getn(brDruids) == 0 then
-            local noFs = viewerFrame:CreateFontString(nil,"OVERLAY")
-            noFs:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
-            noFs:SetPoint("TOPLEFT",viewerFrame,"TOPLEFT",PAD+4,yOff)
-            noFs:SetTextColor(0.5,0.5,0.5)
-            noFs:SetText("(no druids)")
-            table.insert(viewerFrame.content,noFs)
-            yOff = yOff - rowStep
-        else
-            local druidTargets = {}
-            local claimedDead  = {}
-            for _,dname in ipairs(brDruids) do
-                local tgt = brTargeted[dname]
-                if tgt then druidTargets[dname] = tgt claimedDead[tgt] = true end
-            end
-            local freeDruids = {}
-            for _,dname in ipairs(brDruids) do
-                if not druidTargets[dname] then table.insert(freeDruids, dname) end
-            end
-            local fdi = 1
-            for _,d in ipairs(brDeadList) do
-                if not claimedDead[d.name] and fdi <= table.getn(freeDruids) then
-                    druidTargets[freeDruids[fdi]] = d.name
-                    fdi = fdi + 1
+
+        local brCol1 = colMinW                          -- druid name
+        local brCol2 = brCD_W                           -- CD: "90s"/"30m"
+        local brCol3 = innerW - brCol1 - brCol2 - 2    -- target name
+
+        if not collapsed then
+            if table.getn(brDruids) == 0 then
+                vfNoDruidsFS:ClearAllPoints()
+                vfNoDruidsFS:SetFont("Fonts\\FRIZQT__.TTF", fontSize, "")
+                vfNoDruidsFS:SetPoint("TOPLEFT",viewerFrame,"TOPLEFT",PAD+4,yOff)
+                vfNoDruidsFS:SetTextColor(0.5,0.5,0.5)
+                vfNoDruidsFS:SetText("(no druids)")
+                vfNoDruidsFS:Show()
+                yOff = yOff - rowStep
+            else
+                local druidTargets = {}
+                local claimedDead  = {}
+                for _,dname in ipairs(brDruids) do
+                    local tgt = brTargeted[dname]
+                    if tgt then druidTargets[dname] = tgt claimedDead[tgt] = true end
                 end
-            end
-
-            local brCol1 = math.floor(innerW * 0.42)
-            local brCol2 = math.floor(innerW * 0.16)
-            local brCol3 = innerW - brCol1 - brCol2 - 2
-
-            local function RenderRebirthBlock(druidName, cdRem2, targetName, isClaimed, dr2,dg2,db2)
-                local blockH = rowStep + 2
-                local block = CreateFrame("Frame",nil,viewerFrame)
-                block:SetPoint("TOPLEFT", viewerFrame,"TOPLEFT", PAD, yOff)
-                block:SetWidth(innerW)
-                block:SetHeight(blockH)
-                block:SetBackdrop({
-                    bgFile   = "Interface\\Buttons\\WHITE8X8",
-                    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-                    tile=true, tileSize=8, edgeSize=8,
-                    insets={left=2,right=2,top=2,bottom=2}
-                })
-                block:SetBackdropColor(dr2*0.05, dg2*0.05, db2*0.05, 0.4)
-                block:SetBackdropBorderColor(dr2*0.5, dg2*0.5, db2*0.5, 0.6)
-                table.insert(viewerFrame.content, block)
-                local fsD = block:CreateFontString(nil,"OVERLAY")
-                fsD:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
-                fsD:SetPoint("TOPLEFT",block,"TOPLEFT",4,-2)
-                fsD:SetWidth(brCol1 - 8) fsD:SetHeight(rowStep)
-                fsD:SetJustifyH("LEFT") fsD:SetJustifyV("MIDDLE")
-                fsD:SetTextColor(dr2,dg2,db2) fsD:SetText(druidName)
-                local vd1 = block:CreateTexture(nil,"ARTWORK")
-                vd1:SetWidth(1)
-                vd1:SetPoint("TOPLEFT",    block,"TOPLEFT",  brCol1, -2)
-                vd1:SetPoint("BOTTOMLEFT", block,"BOTTOMLEFT",brCol1,  2)
-                vd1:SetTexture(dr2*0.5, dg2*0.5, db2*0.5, 0.5)
-                local fsCD = block:CreateFontString(nil,"OVERLAY")
-                fsCD:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
-                fsCD:SetPoint("TOPLEFT",block,"TOPLEFT", brCol1+4, -2)
-                fsCD:SetWidth(brCol2 - 8) fsCD:SetHeight(rowStep)
-                fsCD:SetJustifyH("CENTER") fsCD:SetJustifyV("MIDDLE")
-                if cdRem2 > 0 then
-                    fsCD:SetTextColor(1,1,0)
-                    if cdRem2 <= 90 then fsCD:SetText(math.ceil(cdRem2).."s")
-                    else fsCD:SetText(math.ceil(cdRem2/60).."m") end
-                else fsCD:SetText("") end
-                local vd2 = block:CreateTexture(nil,"ARTWORK")
-                vd2:SetWidth(1)
-                vd2:SetPoint("TOPLEFT",    block,"TOPLEFT",  brCol1+brCol2+1, -2)
-                vd2:SetPoint("BOTTOMLEFT", block,"BOTTOMLEFT",brCol1+brCol2+1,  2)
-                vd2:SetTexture(dr2*0.5, dg2*0.5, db2*0.5, 0.5)
-                local fsTgt = block:CreateFontString(nil,"OVERLAY")
-                fsTgt:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
-                fsTgt:SetPoint("TOPLEFT",block,"TOPLEFT", brCol1+brCol2+5, -2)
-                fsTgt:SetWidth(brCol3 - 8) fsTgt:SetHeight(rowStep)
-                fsTgt:SetJustifyH("LEFT") fsTgt:SetJustifyV("MIDDLE")
-                if targetName then
-                    if isClaimed then
-                        fsTgt:SetTextColor(1,0.85,0.85)
-                        fsTgt:SetText(targetName)
-                    else
-                        fsTgt:SetTextColor(1,0.3,0.3)
-                        fsTgt:SetText("|cffff4444[!]|r "..targetName)
+                local freeDruids = {}
+                for _,dname in ipairs(brDruids) do
+                    if not druidTargets[dname] then table.insert(freeDruids, dname) end
+                end
+                local fdi = 1
+                for _,d in ipairs(brDeadList) do
+                    if not claimedDead[d.name] and fdi <= table.getn(freeDruids) then
+                        druidTargets[freeDruids[fdi]] = d.name
+                        fdi = fdi + 1
                     end
-                else fsTgt:SetText("") end
-                yOff = yOff - blockH - 3
-            end
-
-            for _,dname in ipairs(brDruids) do
-                local tgt = druidTargets[dname]
-                local cdRem = BR_GetCDRemaining(dname)
-                local dr,dg,db = GetClassColor("DRUID")
-                RenderRebirthBlock(dname, cdRem, tgt, brTargeted[dname] ~= nil, dr,dg,db)
-            end
-
-            local orphaned = {}
-            for _,d in ipairs(brDeadList) do
-                local assigned = false
-                for _,dtgt in pairs(druidTargets) do
-                    if dtgt == d.name then assigned = true break end
                 end
-                if not assigned then table.insert(orphaned, d.name) end
-            end
-            for _,uname in ipairs(orphaned) do
-                local fakeM2 = {display="|cffff4444[!] No druid:|r "..uname, ttype="dead", tvalue=uname}
-                RenderTargetBlock(fakeM2, {}, 1,0.2,0.2)
+
+                -- Helper: get Rebirth block from pool
+                local function UseRebirthBlock(druidName, cdRem2, targetName, isClaimed, dr2,dg2,db2)
+                    local blockH = rowStep + 2
+                    vfRbkUsed = vfRbkUsed + 1
+                    local blk = VF_RBK_POOL[vfRbkUsed]
+                    if not blk then return end
+                    blk:ClearAllPoints()
+                    blk:SetPoint("TOPLEFT", viewerFrame,"TOPLEFT", PAD, yOff)
+                    blk:SetWidth(innerW)
+                    blk:SetHeight(blockH)
+                    blk:SetBackdropColor(dr2*0.05, dg2*0.05, db2*0.05, 0.4)
+                    blk:SetBackdropBorderColor(dr2*0.5, dg2*0.5, db2*0.5, 0.6)
+                    blk.fsD:ClearAllPoints()
+                    blk.fsD:SetFont("Fonts\\FRIZQT__.TTF", fontSize, "")
+                    blk.fsD:SetPoint("TOPLEFT",blk,"TOPLEFT",4,-2)
+                    blk.fsD:SetWidth(brCol1 - 8) blk.fsD:SetHeight(rowStep)
+                    blk.fsD:SetTextColor(dr2,dg2,db2) blk.fsD:SetText(druidName)
+                    blk.vd1:ClearAllPoints()
+                    blk.vd1:SetPoint("TOPLEFT",    blk,"TOPLEFT",   brCol1, -2)
+                    blk.vd1:SetPoint("BOTTOMLEFT", blk,"BOTTOMLEFT", brCol1,  2)
+                    blk.vd1:SetTexture(dr2*0.5, dg2*0.5, db2*0.5, 0.5)
+                    blk.fsCD:ClearAllPoints()
+                    blk.fsCD:SetFont("Fonts\\FRIZQT__.TTF", fontSize, "")
+                    blk.fsCD:SetPoint("TOPLEFT",blk,"TOPLEFT", brCol1+4, -2)
+                    blk.fsCD:SetWidth(brCol2 - 8) blk.fsCD:SetHeight(rowStep)
+                    if cdRem2 > 0 then
+                        blk.fsCD:SetTextColor(1,1,0)
+                        if cdRem2 <= 90 then blk.fsCD:SetText(math.ceil(cdRem2).."s")
+                        else blk.fsCD:SetText(math.ceil(cdRem2/60).."m") end
+                    else blk.fsCD:SetTextColor(1,1,1) blk.fsCD:SetText("") end
+                    blk.vd2:ClearAllPoints()
+                    blk.vd2:SetPoint("TOPLEFT",    blk,"TOPLEFT",   brCol1+brCol2+1, -2)
+                    blk.vd2:SetPoint("BOTTOMLEFT", blk,"BOTTOMLEFT", brCol1+brCol2+1,  2)
+                    blk.vd2:SetTexture(dr2*0.5, dg2*0.5, db2*0.5, 0.5)
+                    blk.fsTgt:ClearAllPoints()
+                    blk.fsTgt:SetFont("Fonts\\FRIZQT__.TTF", fontSize, "")
+                    blk.fsTgt:SetPoint("TOPLEFT",blk,"TOPLEFT", brCol1+brCol2+5, -2)
+                    blk.fsTgt:SetWidth(brCol3 - 8) blk.fsTgt:SetHeight(rowStep)
+                    if targetName then
+                        if isClaimed then
+                            blk.fsTgt:SetTextColor(1,0.85,0.85)
+                            blk.fsTgt:SetText(targetName)
+                        else
+                            blk.fsTgt:SetTextColor(1,0.3,0.3)
+                            blk.fsTgt:SetText(targetName)
+                        end
+                    else blk.fsTgt:SetTextColor(1,1,1) blk.fsTgt:SetText("") end
+                    blk:Show()
+                    yOff = yOff - blockH - 3
+                end
+
+                for _,dname in ipairs(brDruids) do
+                    local tgt = druidTargets[dname]
+                    local cdRem = BR_GetCDRemaining(dname)
+                    local dr,dg,db = GetClassColor("DRUID")
+                    UseRebirthBlock(dname, cdRem, tgt, brTargeted[dname] ~= nil, dr,dg,db)
+                end
+
+                -- Orphaned dead (no free druid available)
+                local orphaned = {}
+                for _,d in ipairs(brDeadList) do
+                    local assigned = false
+                    for _,dtgt in pairs(druidTargets) do
+                        if dtgt == d.name then assigned = true break end
+                    end
+                    if not assigned then table.insert(orphaned, d.name) end
+                end
+                for _,uname in ipairs(orphaned) do
+                    local fakeM2 = {display=uname, ttype="dead", tvalue=uname}
+                    UseTargetBlock(fakeM2, {}, 1,0.2,0.2)
+                end
             end
         end
     end
@@ -1187,19 +1380,92 @@ end
 -------------------------------------------------------------------------------
 -- ASSIGN FRAME (personal frame showing my targets + unattended)
 -------------------------------------------------------------------------------
+-- Widget pool for assignFrame (healers)
+-- Headers and blocks are created once; on each update only
+-- text/color/position/visibility changes.
+local AF_HDR_POOL  = {}   -- section headers
+local AF_BLK_POOL  = {}   -- target blocks
+local AF_HDR_MAX   = 12
+local AF_BLK_MAX   = 30
+local afHdrUsed    = 0
+local afBlkUsed    = 0
+
+-- Dead player button pool for Rebirth section (druid-healer)
+-- Up to 40 raid members can die
+local AF_DEAD_POOL = {}
+local AF_DEAD_MAX  = 40
+local afDeadUsed   = 0
+
+local function AF_EnsurePools(fontSize)
+    while table.getn(AF_HDR_POOL) < AF_HDR_MAX do
+        local hdr = CreateFrame("Frame", nil, assignFrame)
+        hdr:SetBackdrop({bgFile="Interface\\Buttons\\WHITE8X8",
+            insets={left=0,right=0,top=0,bottom=0}})
+        hdr:Hide()
+        local fs = hdr:CreateFontString(nil,"OVERLAY")
+        fs:SetPoint("LEFT",  hdr,"LEFT",  4, 0)
+        fs:SetPoint("RIGHT", hdr,"RIGHT", -4, 0)
+        fs:SetJustifyH("CENTER")
+        hdr.fs = fs
+        table.insert(AF_HDR_POOL, hdr)
+    end
+    while table.getn(AF_BLK_POOL) < AF_BLK_MAX do
+        local blk = CreateFrame("Frame", nil, assignFrame)
+        blk:SetBackdrop({
+            bgFile   = "Interface\\Buttons\\WHITE8X8",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile=true, tileSize=8, edgeSize=8,
+            insets={left=2,right=2,top=2,bottom=2}
+        })
+        blk:Hide()
+        local fs = blk:CreateFontString(nil,"OVERLAY")
+        fs:SetJustifyH("LEFT") fs:SetJustifyV("MIDDLE")
+        blk.fs = fs
+        table.insert(AF_BLK_POOL, blk)
+    end
+    while table.getn(AF_DEAD_POOL) < AF_DEAD_MAX do
+        local row = CreateFrame("Button", nil, assignFrame)
+        row:SetBackdrop({
+            bgFile   = "Interface\\Buttons\\WHITE8X8",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile=true, tileSize=8, edgeSize=8,
+            insets={left=2,right=2,top=2,bottom=2}
+        })
+        row:Hide()
+        local fs2 = row:CreateFontString(nil,"OVERLAY")
+        fs2:SetJustifyH("LEFT") fs2:SetJustifyV("MIDDLE")
+        row.fs2 = fs2
+        local icF2 = CreateFrame("Frame",nil,row)
+        local icT2 = icF2:CreateTexture(nil,"OVERLAY")
+        icT2:SetAllPoints(icF2)
+        icT2:SetTexture("Interface\\Buttons\\WHITE8X8")
+        row.icF2 = icF2
+        row.icT2 = icT2
+        table.insert(AF_DEAD_POOL, row)
+    end
+end
+
+local function AF_HideAll()
+    for _,h in ipairs(AF_HDR_POOL) do h:Hide() end
+    for _,b in ipairs(AF_BLK_POOL) do b:Hide() end
+    for _,r in ipairs(AF_DEAD_POOL) do r:Hide() r:SetScript("OnClick",nil) r:EnableMouse(false) end
+    afHdrUsed = 0
+    afBlkUsed = 0
+    afDeadUsed = 0
+end
+
 local function UpdateAssignFrame()
     if not assignFrame then return end
-
-    for _,c in ipairs(assignFrame.content or {}) do c:Hide() end
-    assignFrame.content = {}
 
     local inRaid = GetNumRaidMembers() > 0
     local showOutsideRaid = HealAssignDB and HealAssignDB.options and HealAssignDB.options.showAssignFrame
     if not inRaid and not showOutsideRaid then
+        AF_HideAll()
         assignFrame:Hide()
         return
     end
     if not HA_ShouldShow() then
+        AF_HideAll()
         assignFrame:Hide()
         return
     end
@@ -1207,20 +1473,14 @@ local function UpdateAssignFrame()
     local myName   = UnitName("player")
     local tmpl     = GetActiveTemplate()
     local fontSize = (HealAssignDB.options and HealAssignDB.options.fontSize) or 12
-    local PAD     = 6
-    local ICON_SZ = math.floor(fontSize * 2.5)
-    if ICON_SZ < 20 then ICON_SZ = 20 end
-    if ICON_SZ > 48 then ICON_SZ = 48 end
+    local PAD_H    = 6
 
     local myTargets     = {}
     local myDeadTargets = {}
 
-    -- Determine player role
     local myPdata = tmpl and tmpl.roster and tmpl.roster[myName]
     local isHealer = myPdata and myPdata.tagH
-    local isViewer = myPdata and myPdata.tagV
 
-    -- Collect my targets
     if tmpl then
         for _,h in ipairs(tmpl.healers) do
             if h.name == myName then myTargets = h.targets break end
@@ -1234,106 +1494,82 @@ local function UpdateAssignFrame()
         end
     end
 
-    -- assignFrame shows ONLY healer window (H tag)
-    -- Viewer window (V tag) is handled separately by UpdateViewerFrame()
     if not isHealer then
+        AF_HideAll()
         assignFrame:Hide()
         return
     end
 
-    -- Frame width: healer window is narrower
-    local frameW = math.max(130, math.min(260, fontSize * 13))
+    -- Frame width: max of (single name column) vs (innervate block: icon + name)
+    local nameW_H    = HA_MaxNameWidth(tmpl, fontSize)
+    local INN_ICON_W = math.max(18, math.min(44, math.floor(fontSize * 2.0)))
+    local colMinW_H  = math.floor(nameW_H) + 16
+    local innBlockW  = INN_ICON_W + math.floor(nameW_H) + 20  -- icon + gap + name + padding
+    local frameW     = math.max(80, math.max(colMinW_H, innBlockW) + PAD_H * 2)
     assignFrame:SetWidth(frameW)
 
-    -- Row spacing scales with font size
     local rowH    = fontSize + 4
     local rowStep = fontSize + 5
     local titleH  = fontSize + 8
     local yOff    = -(titleH + 2)
-
-    local function AddRow(text, r,g,b, bgR,bgG,bgB)
-        local row = CreateFrame("Frame",nil,assignFrame)
-        row:SetPoint("TOPLEFT",assignFrame,"TOPLEFT",6,yOff)
-        row:SetWidth(assignFrame:GetWidth()-12)
-        row:SetHeight(rowH)
-        if bgR then
-            row:SetBackdrop({bgFile="Interface\\Buttons\\WHITE8X8",insets={left=0,right=0,top=0,bottom=0}})
-            row:SetBackdropColor(bgR,bgG,bgB,0.3)
-        end
-        local fs = row:CreateFontString(nil,"OVERLAY")
-        fs:SetFont("Fonts\\FRIZQT__.TTF",fontSize)
-        fs:SetPoint("LEFT",row,"LEFT",4,0)
-        fs:SetTextColor(r or 1,g or 1,b or 1)
-        fs:SetText(text)
-        yOff = yOff - rowStep
-        table.insert(assignFrame.content,row)
-    end
-
-    local titleFS = assignFrame:CreateFontString(nil,"OVERLAY","GameFontNormal")
-    titleFS:SetPoint("TOP",assignFrame,"TOP",0,-3)
-    titleFS:SetTextColor(1,0.82,0.0)
-    titleFS:SetText("My Assignments")
-    table.insert(assignFrame.content,titleFS)
-
-
-    -- Healer window: same style as viewer (Tanks / Groups / Innervate sections)
-    local PAD_H   = 6
     local innerW_H = frameW - PAD_H*2
 
-    -- Centered section header (no icon)
+    -- Initialize pools if needed
+    AF_EnsurePools(fontSize)
+    AF_HideAll()
+
+    -- Window title (created once in CreateAssignFrame)
+    if assignFrame.titleFS then
+        assignFrame.titleFS:SetFont("Fonts\\FRIZQT__.TTF", fontSize, "")
+        assignFrame.titleFS:Show()
+    end
+
+    -- Helper: section header from pool
     local function HAddHeader(text, r,g,b, bgMul)
         bgMul = bgMul or 0.18
-        local hdr = CreateFrame("Frame",nil,assignFrame)
+        afHdrUsed = afHdrUsed + 1
+        local hdr = AF_HDR_POOL[afHdrUsed]
+        if not hdr then return end
+        hdr:ClearAllPoints()
         hdr:SetPoint("TOPLEFT",assignFrame,"TOPLEFT",PAD_H,yOff)
         hdr:SetWidth(innerW_H)
         hdr:SetHeight(rowH + 2)
-        hdr:SetBackdrop({bgFile="Interface\\Buttons\\WHITE8X8",
-            insets={left=0,right=0,top=0,bottom=0}})
         hdr:SetBackdropColor(r*bgMul, g*bgMul, b*bgMul, 0.7)
-        table.insert(assignFrame.content, hdr)
-        local fs = hdr:CreateFontString(nil,"OVERLAY")
-        fs:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"OUTLINE")
-        fs:SetPoint("LEFT", hdr,"LEFT",  0, 0)
-        fs:SetPoint("RIGHT",hdr,"RIGHT", 0, 0)
-        fs:SetJustifyH("CENTER")
-        fs:SetTextColor(r,g,b)
-        fs:SetText(text)
+        hdr.fs:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"OUTLINE")
+        hdr.fs:SetTextColor(r,g,b)
+        hdr.fs:SetText(text)
+        hdr:Show()
         yOff = yOff - (rowH + 4)
     end
 
-    -- Single full-width bordered block
+    -- Helper: target block from pool
     local function HAddBlock(text, r,g,b)
-        local block = CreateFrame("Frame",nil,assignFrame)
-        block:SetPoint("TOPLEFT",assignFrame,"TOPLEFT",PAD_H,yOff)
-        block:SetWidth(innerW_H)
-        block:SetHeight(rowStep + 2)
-        block:SetBackdrop({
-            bgFile   = "Interface\\Buttons\\WHITE8X8",
-            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-            tile=true, tileSize=8, edgeSize=8,
-            insets={left=2,right=2,top=2,bottom=2}
-        })
-        block:SetBackdropColor(r*0.05, g*0.05, b*0.05, 0.4)
-        block:SetBackdropBorderColor(r*0.5, g*0.5, b*0.5, 0.6)
-        table.insert(assignFrame.content, block)
-        local fs = block:CreateFontString(nil,"OVERLAY")
-        fs:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
-        fs:SetPoint("LEFT", block,"LEFT",   6, 0)
-        fs:SetPoint("RIGHT",block,"RIGHT", -4, 0)
-        fs:SetHeight(rowStep + 2)
-        fs:SetJustifyH("LEFT")
-        fs:SetJustifyV("MIDDLE")
-        fs:SetTextColor(r,g,b)
-        fs:SetText(text)
+        afBlkUsed = afBlkUsed + 1
+        local blk = AF_BLK_POOL[afBlkUsed]
+        if not blk then return end
+        blk:ClearAllPoints()
+        blk:SetPoint("TOPLEFT",assignFrame,"TOPLEFT",PAD_H,yOff)
+        blk:SetWidth(innerW_H)
+        blk:SetHeight(rowStep + 2)
+        blk:SetBackdropColor(r*0.05, g*0.05, b*0.05, 0.4)
+        blk:SetBackdropBorderColor(r*0.5, g*0.5, b*0.5, 0.6)
+        blk.fs:ClearAllPoints()
+        blk.fs:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
+        blk.fs:SetPoint("LEFT", blk,"LEFT",   6, 0)
+        blk.fs:SetPoint("RIGHT",blk,"RIGHT", -4, 0)
+        blk.fs:SetHeight(rowStep + 2)
+        blk.fs:SetTextColor(r,g,b)
+        blk.fs:SetText(text)
+        blk:Show()
         yOff = yOff - (rowStep + 2) - 3
     end
 
-    -- Collect my targets by type
+    -- Targets by type
     local myTanks, myGroups, myCustom = {},{},{}
     for _,t in ipairs(myTargets) do
-        if t.type == TYPE_TANK        then table.insert(myTanks,  t)
-        elseif t.type == TYPE_GROUP   then table.insert(myGroups, t)
-        else                               table.insert(myCustom, t) end
+        if t.type == TYPE_TANK      then table.insert(myTanks,  t)
+        elseif t.type == TYPE_GROUP then table.insert(myGroups, t)
+        else                             table.insert(myCustom, t) end
     end
     table.sort(myGroups, function(a,b)
         return (tonumber(a.value) or 0) < (tonumber(b.value) or 0)
@@ -1370,7 +1606,7 @@ local function UpdateAssignFrame()
         end
     end
 
-    -- ── Innervate (only for non-druid healers) ────────────────────
+    -- Innervate (non-druid healers only)
     local _,myClass = UnitClass("player")
     local amDruidHealer = myClass == "DRUID"
     local myInnDruid = nil
@@ -1383,53 +1619,72 @@ local function UpdateAssignFrame()
         yOff = yOff - 2
         HAddHeader("Innervate", 1,0.65,0.1, 0.15)
         local cdRem   = INN_GetCDRemaining(myInnDruid)
-        local isReady = cdRem <= 0
-        local ICON_SZ = math.max(18, math.min(44, math.floor(fontSize * 2.0)))
+        local isReady = math.floor(cdRem) <= 0
+        local INN_ICON_SZ = math.max(18, math.min(44, math.floor(fontSize * 2.0)))
         local dr2,dg2,db2 = GetClassColor("DRUID")
-        local block = CreateFrame("Frame",nil,assignFrame)
-        block:SetPoint("TOPLEFT",assignFrame,"TOPLEFT",PAD_H,yOff)
-        block:SetWidth(innerW_H)
-        block:SetHeight(ICON_SZ + 4)
-        block:SetBackdrop({
-            bgFile   = "Interface\\Buttons\\WHITE8X8",
-            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-            tile=true, tileSize=8, edgeSize=8,
-            insets={left=2,right=2,top=2,bottom=2}
-        })
-        block:SetBackdropColor(dr2*0.05, dg2*0.05, db2*0.05, 0.4)
-        block:SetBackdropBorderColor(dr2*0.5, dg2*0.5, db2*0.5, 0.6)
-        table.insert(assignFrame.content, block)
-        local iconCont = CreateFrame("Frame",nil,block)
-        iconCont:SetWidth(ICON_SZ) iconCont:SetHeight(ICON_SZ)
-        iconCont:SetPoint("LEFT",block,"LEFT",4,0)
-        local iTex = iconCont:CreateTexture(nil,"BACKGROUND")
-        iTex:SetAllPoints(iconCont)
-        iTex:SetTexture(INN_ICON)
-        if not isReady then
-            iTex:SetVertexColor(0.35,0.35,0.35)
-            local mins = math.floor(cdRem/60)
-            local secs = math.floor(math.mod(cdRem,60))
+        -- Innervate block (created once)
+        if not assignFrame._innBlock then
+            local blk = CreateFrame("Frame",nil,assignFrame)
+            blk:SetBackdrop({
+                bgFile   = "Interface\\Buttons\\WHITE8X8",
+                edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+                tile=true, tileSize=8, edgeSize=8,
+                insets={left=2,right=2,top=2,bottom=2}
+            })
+            local iconCont = CreateFrame("Frame",nil,blk)
+            local iTex = iconCont:CreateTexture(nil,"BACKGROUND")
+            iTex:SetAllPoints(iconCont)
+            iTex:SetTexture(INN_ICON)
             local cdFS = iconCont:CreateFontString(nil,"OVERLAY")
-            cdFS:SetFont("Fonts\\FRIZQT__.TTF",math.max(8,math.floor(fontSize*0.85)),"OUTLINE")
             cdFS:SetPoint("CENTER",iconCont,"CENTER",0,0)
             cdFS:SetTextColor(1,1,1)
-            cdFS:SetText(string.format("%d:%02d",mins,secs))
+            local nameFS = blk:CreateFontString(nil,"OVERLAY")
+            nameFS:SetJustifyH("LEFT") nameFS:SetJustifyV("MIDDLE")
+            assignFrame._innBlock    = blk
+            assignFrame._innIconCont = iconCont
+            assignFrame._innIconTex  = iTex
+            assignFrame._innCDFS     = cdFS
+            assignFrame._innNameFS   = nameFS
         end
-        local nameFS = block:CreateFontString(nil,"OVERLAY")
-        nameFS:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
-        nameFS:SetPoint("LEFT", block,"LEFT",  ICON_SZ+8, 0)
-        nameFS:SetPoint("RIGHT",block,"RIGHT", -4, 0)
-        nameFS:SetHeight(ICON_SZ + 4)
-        nameFS:SetJustifyH("LEFT")
-        nameFS:SetJustifyV("MIDDLE")
-        nameFS:SetTextColor(isReady and dr2 or dr2*0.6,
-                            isReady and dg2 or dg2*0.6,
-                            isReady and db2 or db2*0.6)
-        nameFS:SetText(myInnDruid)
-        yOff = yOff - ICON_SZ - 4 - 3
+        local blk = assignFrame._innBlock
+        blk:ClearAllPoints()
+        blk:SetPoint("TOPLEFT",assignFrame,"TOPLEFT",PAD_H,yOff)
+        blk:SetWidth(innerW_H)
+        blk:SetHeight(INN_ICON_SZ + 4)
+        blk:SetBackdropColor(dr2*0.05, dg2*0.05, db2*0.05, 0.4)
+        blk:SetBackdropBorderColor(dr2*0.5, dg2*0.5, db2*0.5, 0.6)
+        assignFrame._innIconCont:SetWidth(INN_ICON_SZ)
+        assignFrame._innIconCont:SetHeight(INN_ICON_SZ)
+        assignFrame._innIconCont:ClearAllPoints()
+        assignFrame._innIconCont:SetPoint("LEFT",blk,"LEFT",4,0)
+        local cdFSz = math.max(8,math.floor(fontSize*0.85))
+        assignFrame._innCDFS:SetFont("Fonts\\FRIZQT__.TTF",cdFSz,"OUTLINE")
+        if not isReady then
+            assignFrame._innIconTex:SetVertexColor(0.35,0.35,0.35)
+            local mins = math.floor(cdRem/60)
+            local secs = math.floor(math.mod(cdRem,60))
+            assignFrame._innCDFS:SetText(string.format("%d:%02d",mins,secs))
+        else
+            assignFrame._innIconTex:SetVertexColor(1,1,1)
+            assignFrame._innCDFS:SetText("")
+        end
+        assignFrame._innNameFS:ClearAllPoints()
+        assignFrame._innNameFS:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
+        assignFrame._innNameFS:SetPoint("LEFT", blk,"LEFT",  INN_ICON_SZ+8, 0)
+        assignFrame._innNameFS:SetPoint("RIGHT",blk,"RIGHT", -4, 0)
+        assignFrame._innNameFS:SetHeight(INN_ICON_SZ + 4)
+        assignFrame._innNameFS:SetTextColor(
+            isReady and dr2 or dr2*0.6,
+            isReady and dg2 or dg2*0.6,
+            isReady and db2 or db2*0.6)
+        assignFrame._innNameFS:SetText(myInnDruid)
+        blk:Show()
+        yOff = yOff - INN_ICON_SZ - 4 - 3
+    else
+        if assignFrame._innBlock then assignFrame._innBlock:Hide() end
     end
 
-    -- ── Cover Targets (dead healers) ──────────────────────────────
+    -- Cover Targets (dead healers)
     if table.getn(myDeadTargets) > 0 then
         yOff = yOff - 2
         HAddHeader("Cover Targets", 1,0.2,0.2, 0.25)
@@ -1446,15 +1701,14 @@ local function UpdateAssignFrame()
             if tmpl and tmpl.roster and tmpl.roster[dname] then
                 dr2,dg2,db2 = GetClassColor(tmpl.roster[dname].class)
             end
-            HAddBlock(dname.." [dead]", dr2,dg2,db2)
+            HAddBlock(dname, dr2,dg2,db2)
             for _,t in ipairs(healerTargets[dname]) do
                 local tr2,tg2,tb2 = 0.5,0.85,1.0
                 if t.type == TYPE_TANK then
                     if tmpl and tmpl.roster and tmpl.roster[t.value] then
                         tr2,tg2,tb2 = GetClassColor(tmpl.roster[t.value].class)
                     end
-                elseif t.type == TYPE_CUSTOM then tr2,tg2,tb2 = 0.9,0.6,1.0
-                end
+                elseif t.type == TYPE_CUSTOM then tr2,tg2,tb2 = 0.9,0.6,1.0 end
                 local disp2 = t.value or "?"
                 if t.type == TYPE_GROUP then disp2 = "Group "..t.value end
                 HAddBlock(disp2, tr2,tg2,tb2)
@@ -1462,23 +1716,22 @@ local function UpdateAssignFrame()
         end
     end
 
-
-    -- ── Rebirth (only for druid-healers) ──────────────────────────
+    -- Rebirth (druid-healers only)
     if amDruidHealer and tmpl then
         yOff = yOff - 2
         HAddHeader("Rebirth", 0.7,0.3,1, 0.15)
-        local brCDRem = BR_GetCDRemaining(myName)
+        local brCDRem   = BR_GetCDRemaining(myName)
         local BR_ICON_SZ = math.max(18, math.min(44, math.floor(fontSize * 2.0)))
         local cdFontSz2 = math.floor(fontSize * 0.85)
         if cdFontSz2 < 8 then cdFontSz2 = 8 end
-        local BTN_H2 = fontSize + 8
-        local rowH2  = fontSize + 8
-        local innerW2 = frameW - PAD_H*2
+        local BTN_H2   = fontSize + 8
+        local rowH2    = fontSize + 8
+        local innerW2  = frameW - PAD_H*2
         local iconSzSm = math.floor(fontSize * 1.2)
         if iconSzSm < 10 then iconSzSm = 10 end
         if iconSzSm > 20 then iconSzSm = 20 end
 
-        -- BR icon centered
+        -- BR icon (created once)
         if not assignFrame._brIconF then
             local brIF = CreateFrame("Frame",nil,assignFrame)
             local brIT = brIF:CreateTexture(nil,"BACKGROUND")
@@ -1508,33 +1761,27 @@ local function UpdateAssignFrame()
         end
         yOff = yOff - BR_ICON_SZ - PAD_H
 
-        -- Dead list
-        if not assignFrame._brDeadBtns then assignFrame._brDeadBtns = {} end
-        for _,b in ipairs(assignFrame._brDeadBtns) do b:Hide() end
-        assignFrame._brDeadBtns = {}
-
+        -- Dead list - use AF_DEAD_POOL
+        local myNameCap = myName
         for _,d in ipairs(brDeadList) do
             local dname = d.name
             local takenBy = nil
             for druid,target in pairs(brTargeted) do
-                if target == dname and druid ~= myName then takenBy = druid end
+                if target == dname and druid ~= myNameCap then takenBy = druid end
             end
-            local isMine = brTargeted[myName] == dname
+            local isMine = brTargeted[myNameCap] == dname
             local cr,cg,cb = 0.6,0.5,0.5
             if tmpl.roster and tmpl.roster[dname] then
                 cr,cg,cb = GetClassColor(tmpl.roster[dname].class)
             end
-            local row = CreateFrame("Button",nil,assignFrame)
+            afDeadUsed = afDeadUsed + 1
+            local row = AF_DEAD_POOL[afDeadUsed]
+            if not row then break end
+            row:ClearAllPoints()
             row:SetPoint("TOPLEFT",assignFrame,"TOPLEFT",PAD_H,yOff)
             row:SetWidth(innerW2)
             row:SetHeight(rowH2)
             row:EnableMouse(not takenBy and not isMine and brCDRem <= 0)
-            row:SetBackdrop({
-                bgFile   = "Interface\\Buttons\\WHITE8X8",
-                edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-                tile=true, tileSize=8, edgeSize=8,
-                insets={left=2,right=2,top=2,bottom=2}
-            })
             if isMine then
                 row:SetBackdropColor(cr*0.35,cg*0.35,cb*0.35,0.9)
                 row:SetBackdropBorderColor(cr,cg,cb,0.9)
@@ -1545,45 +1792,47 @@ local function UpdateAssignFrame()
                 row:SetBackdropColor(cr*0.12,cg*0.12,cb*0.12,0.8)
                 row:SetBackdropBorderColor(cr*0.4,cg*0.4,cb*0.4,0.7)
             end
-            local fs2 = row:CreateFontString(nil,"OVERLAY")
-            fs2:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
-            fs2:SetPoint("LEFT",row,"LEFT",6,0)
-            fs2:SetPoint("RIGHT",row,"RIGHT",-(iconSzSm+8),0)
-            fs2:SetHeight(rowH2)
-            fs2:SetJustifyH("LEFT") fs2:SetJustifyV("MIDDLE")
-            if isMine then fs2:SetTextColor(cr,cg,cb)
+            row.fs2:ClearAllPoints()
+            row.fs2:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
+            row.fs2:SetPoint("LEFT",row,"LEFT",6,0)
+            row.fs2:SetPoint("RIGHT",row,"RIGHT",-(iconSzSm+8),0)
+            row.fs2:SetHeight(rowH2)
+            if isMine then
+                row.fs2:SetTextColor(cr,cg,cb)
+                row.fs2:SetText(dname)
             elseif takenBy then
-                fs2:SetTextColor(0.4,0.4,0.4)
-                fs2:SetText(dname.." |cff666666("..takenBy..")|r")
-            else fs2:SetTextColor(0.9,0.85,0.75) end
-            if not takenBy then fs2:SetText(dname) end
-            local icF2 = CreateFrame("Frame",nil,row)
-            icF2:SetWidth(iconSzSm) icF2:SetHeight(iconSzSm)
-            icF2:SetPoint("RIGHT",row,"RIGHT",-4,0)
-            local icT2 = icF2:CreateTexture(nil,"OVERLAY")
-            icT2:SetAllPoints(icF2)
-            icT2:SetTexture("Interface\\Buttons\\WHITE8X8")
-            if isMine then icT2:SetVertexColor(1,0.85,0)
-            elseif takenBy then icT2:SetVertexColor(1,0.2,0.2)
-            else icT2:SetVertexColor(0.2,1,0.2) end
+                row.fs2:SetTextColor(0.4,0.4,0.4)
+                row.fs2:SetText(dname.." |cff666666("..takenBy..")|r")
+            else
+                row.fs2:SetTextColor(0.9,0.85,0.75)
+                row.fs2:SetText(dname)
+            end
+            row.icF2:SetWidth(iconSzSm) row.icF2:SetHeight(iconSzSm)
+            row.icF2:ClearAllPoints()
+            row.icF2:SetPoint("RIGHT",row,"RIGHT",-4,0)
+            if isMine then row.icT2:SetVertexColor(1,0.85,0)
+            elseif takenBy then row.icT2:SetVertexColor(1,0.2,0.2)
+            else row.icT2:SetVertexColor(0.2,1,0.2) end
             if not takenBy and not isMine and brCDRem <= 0 then
                 local capName = dname
                 row:SetScript("OnClick",function()
-                    brTargeted[myName] = capName
+                    brTargeted[myNameCap] = capName
                     TargetByName(capName)
-                    BR_BroadcastTarget(myName, capName)
+                    BR_BroadcastTarget(myNameCap, capName)
                     UpdateAssignFrame() UpdateViewerFrame()
                 end)
+            else
+                row:SetScript("OnClick",nil)
             end
+            row:Show()
             yOff = yOff - rowH2 - 3
-            table.insert(assignFrame._brDeadBtns, row)
         end
 
         if table.getn(brDeadList) > 0 then yOff = yOff - 2 end
 
-        -- Rebirth cast button
+        -- Rebirth! button (created once)
         if not assignFrame._brCastBtn then
-            local brBtn = CreateFrame("Button",nil,assignFrame,"UIPanelButtonTemplate")
+            local brBtn = CreateFrame("Button","HealAssignHealBRBtn",assignFrame,"UIPanelButtonTemplate")
             brBtn:SetText("Rebirth!")
             brBtn:SetScript("OnClick",function()
                 local tgt = brTargeted[myName]
@@ -1598,6 +1847,8 @@ local function UpdateAssignFrame()
         brBtn:SetPoint("TOP",assignFrame,"TOP",0,yOff - 2)
         local brBtnW = math.max(80, fontSize * 6)
         brBtn:SetWidth(brBtnW) brBtn:SetHeight(BTN_H2)
+        local brBtnText = getglobal("HealAssignHealBRBtn" .. "Text")
+        if brBtnText then brBtnText:SetFont("Fonts\\FRIZQT__.TTF", fontSize, "") end
         brBtn:Show()
         local hasTarget = brTargeted[myName] ~= nil
         if hasTarget and brCDRem <= 0 then
@@ -1609,11 +1860,7 @@ local function UpdateAssignFrame()
     else
         if assignFrame._brIconF   then assignFrame._brIconF:Hide() end
         if assignFrame._brCastBtn then assignFrame._brCastBtn:Hide() end
-        if assignFrame._brDeadBtns then
-            for _,b in ipairs(assignFrame._brDeadBtns) do b:Hide() end
-        end
     end
-
 
     local totalH = math.abs(yOff) + rowStep + 4
     if totalH < 60 then totalH = 60 end
@@ -1702,21 +1949,14 @@ local function CreateAssignFrame()
     local _alpha = (HealAssignDB and HealAssignDB.options and HealAssignDB.options.windowAlpha) or 0.95
     assignFrame:SetBackdropColor(0.05,0.05,0.1,_alpha)
     assignFrame:SetBackdropBorderColor(0.3,0.6,1,0.8)
-    assignFrame.content = {}
     assignFrame:Hide()
 
-    local optBtn = CreateFrame("Button",nil,assignFrame,"UIPanelButtonTemplate")
-    optBtn:SetWidth(24)
-    optBtn:SetHeight(16)
-    optBtn:SetPoint("TOPRIGHT",assignFrame,"TOPRIGHT",-4,-4)
-    optBtn:SetText("O")
-    optBtn:SetScript("OnClick",function()
-        if optionsFrame and optionsFrame:IsShown() then
-            optionsFrame:Hide()
-        else
-            HealAssign_OpenOptions()
-        end
-    end)
+    -- Window title (created once)
+    local titleFS = assignFrame:CreateFontString(nil,"OVERLAY","GameFontNormal")
+    titleFS:SetPoint("TOP",assignFrame,"TOP",0,-3)
+    titleFS:SetTextColor(1,0.82,0.0)
+    titleFS:SetText("My Assignments")
+    assignFrame.titleFS = titleFS
 end
 
 -------------------------------------------------------------------------------
@@ -1758,9 +1998,12 @@ local function UpdateDruidAssignFrame()
     local BTN_H     = fontSize + 8
     local cdFontSz  = math.floor(fontSize * 0.85)
     if cdFontSz < 8 then cdFontSz = 8 end
-    local frameW    = 100 + fontSize * 8
-    if frameW < 120 then frameW = 120 end
-    if frameW > 260 then frameW = 260 end
+    -- Frame width based on actual measured text width of longest name
+    local tmplD     = GetActiveTemplate()
+    local nameW_D   = HA_MaxNameWidth(tmplD, fontSize)
+    local colMinW_D = math.floor(nameW_D) + 16
+    local btnW_D    = math.max(80, fontSize * 6)
+    local frameW    = math.max(120, math.max(ICON_SZ + colMinW_D + PAD * 2, btnW_D + PAD * 2))
 
     -- Create frame once (always, regardless of assignment)
     if not druidAssignFrame then
@@ -1788,16 +2031,6 @@ local function UpdateDruidAssignFrame()
         local _dy = HealAssignDB and HealAssignDB.options and HealAssignDB.options.druidFrameY or -200
         druidAssignFrame:SetPoint("TOPLEFT",UIParent,"TOPLEFT",_dx,_dy)
 
-        -- Options button
-        local optBtn = CreateFrame("Button",nil,druidAssignFrame,"UIPanelButtonTemplate")
-        optBtn:SetWidth(24) optBtn:SetHeight(16)
-        optBtn:SetPoint("TOPRIGHT",druidAssignFrame,"TOPRIGHT",-4,-4)
-        optBtn:SetText("O")
-        optBtn:SetScript("OnClick",function()
-            if optionsFrame and optionsFrame:IsShown() then optionsFrame:Hide()
-            else HealAssign_OpenOptions() end
-        end)
-
         -- Innervate widgets (shown only when assigned)
         local tFS = druidAssignFrame:CreateFontString(nil,"OVERLAY")
         tFS:SetJustifyH("CENTER")
@@ -1818,7 +2051,7 @@ local function UpdateDruidAssignFrame()
         druidAssignFrame._iconTex   = iTex
         druidAssignFrame._iconCDFS  = iCDFS
 
-        local btn = CreateFrame("Button",nil,druidAssignFrame,"UIPanelButtonTemplate")
+        local btn = CreateFrame("Button","HealAssignDruidInnBtn",druidAssignFrame,"UIPanelButtonTemplate")
         btn:SetText("Innervate!")
         btn:SetScript("OnClick",function()
             local t2 = GetActiveTemplate()
@@ -1848,7 +2081,7 @@ local function UpdateDruidAssignFrame()
         druidAssignFrame._brIconTex = brIT
         druidAssignFrame._brCDFS    = brCDT
 
-        local brBtn = CreateFrame("Button",nil,druidAssignFrame,"UIPanelButtonTemplate")
+        local brBtn = CreateFrame("Button","HealAssignDruidBRBtn",druidAssignFrame,"UIPanelButtonTemplate")
         brBtn:SetText("Rebirth!")
         brBtn:SetScript("OnClick",function()
             local n   = UnitName("player")
@@ -1916,7 +2149,7 @@ local function UpdateDruidAssignFrame()
         local iTex  = druidAssignFrame._iconTex
         local iCDFS = druidAssignFrame._iconCDFS
         iCDFS:SetFont("Fonts\\FRIZQT__.TTF",cdFontSz,"OUTLINE")
-        if cdRem > 0 then
+        if math.floor(cdRem) > 0 then
             iTex:SetVertexColor(0.3,0.3,0.3)
             local mins = math.floor(cdRem/60)
             local secs = math.floor(math.mod(cdRem,60))
@@ -1932,6 +2165,8 @@ local function UpdateDruidAssignFrame()
         btn:SetPoint("TOP",druidAssignFrame,"TOP",0,curY)
         local btnW = math.max(80, fontSize * 6)
         btn:SetWidth(btnW) btn:SetHeight(BTN_H)
+        local innBtnText = getglobal("HealAssignDruidInnBtnText")
+        if innBtnText then innBtnText:SetFont("Fonts\\FRIZQT__.TTF", fontSize, "") end
         btn:Show()
         if cdRem > 0 then
             btn:SetTextColor(0.5,0.5,0.5) btn:EnableMouse(false) btn:SetAlpha(0.5)
@@ -1997,16 +2232,25 @@ local function UpdateDruidAssignFrame()
     end
     curY = curY - ICON_SZ - PAD
 
-    -- Dead list: styled rows with name left + BR icon status right
-    for _,b in ipairs(druidAssignFrame._brDeadBtns) do b:Hide() end
-    druidAssignFrame._brDeadBtns = {}
+    -- Dead list: use per-frame pool (druidAssignFrame._deadPool)
+    -- AF_DEAD_POOL belongs to assignFrame which has a different parent,
+    -- so druids use their own pool stored on druidAssignFrame.
+    if not druidAssignFrame._deadPool then
+        druidAssignFrame._deadPool = {}
+    end
+    for _,r in ipairs(druidAssignFrame._deadPool) do
+        r:Hide() r:SetScript("OnClick",nil) r:EnableMouse(false)
+    end
 
     local myName2  = UnitName("player")
     local rowH2    = fontSize + 8
     local innerW   = frameW - PAD*2
-    local iconSzSm = math.floor(fontSize * 1.2)  -- small icon for status
+    local iconSzSm = math.floor(fontSize * 1.2)
     if iconSzSm < 10 then iconSzSm = 10 end
     if iconSzSm > 20 then iconSzSm = 20 end
+
+    local deadPool = druidAssignFrame._deadPool
+    local deadIdx  = 0
 
     for _,d in ipairs(brDeadList) do
         local dname   = d.name
@@ -2015,25 +2259,38 @@ local function UpdateDruidAssignFrame()
             if target == dname and druid ~= myName2 then takenBy = druid end
         end
         local isMine = brTargeted[myName2] == dname
-
-        -- Class color
         local cr,cg,cb = 0.6,0.5,0.5
         if tmpl and tmpl.roster and tmpl.roster[dname] then
             cr,cg,cb = GetClassColor(tmpl.roster[dname].class)
         end
 
-        -- Row frame with backdrop like HAddBlock
-        local row = CreateFrame("Button",nil,druidAssignFrame)
+        deadIdx = deadIdx + 1
+        local row = deadPool[deadIdx]
+        if not row then
+            row = CreateFrame("Button",nil,druidAssignFrame)
+            row:SetBackdrop({
+                bgFile   = "Interface\\Buttons\\WHITE8X8",
+                edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+                tile=true, tileSize=8, edgeSize=8,
+                insets={left=2,right=2,top=2,bottom=2}
+            })
+            local fs = row:CreateFontString(nil,"OVERLAY")
+            fs:SetJustifyH("LEFT") fs:SetJustifyV("MIDDLE")
+            row.fs = fs
+            local icF = CreateFrame("Frame",nil,row)
+            local icT = icF:CreateTexture(nil,"OVERLAY")
+            icT:SetAllPoints(icF)
+            icT:SetTexture("Interface\\Buttons\\WHITE8X8")
+            row.icF = icF
+            row.icT = icT
+            table.insert(deadPool, row)
+        end
+
+        row:ClearAllPoints()
         row:SetPoint("TOPLEFT",druidAssignFrame,"TOPLEFT",PAD,curY)
         row:SetWidth(innerW)
         row:SetHeight(rowH2)
         row:EnableMouse(not takenBy and not isMine and brCDRem <= 0)
-        row:SetBackdrop({
-            bgFile   = "Interface\\Buttons\\WHITE8X8",
-            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-            tile=true, tileSize=8, edgeSize=8,
-            insets={left=2,right=2,top=2,bottom=2}
-        })
         if isMine then
             row:SetBackdropColor(cr*0.35, cg*0.35, cb*0.35, 0.9)
             row:SetBackdropBorderColor(cr, cg, cb, 0.9)
@@ -2044,41 +2301,27 @@ local function UpdateDruidAssignFrame()
             row:SetBackdropColor(cr*0.12, cg*0.12, cb*0.12, 0.8)
             row:SetBackdropBorderColor(cr*0.4, cg*0.4, cb*0.4, 0.7)
         end
-
-        -- Name text (left aligned, leave room for icon on right)
-        local fs = row:CreateFontString(nil,"OVERLAY")
-        fs:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
-        fs:SetPoint("LEFT",  row,"LEFT",  6, 0)
-        fs:SetPoint("RIGHT", row,"RIGHT", -(iconSzSm + 8), 0)
-        fs:SetHeight(rowH2)
-        fs:SetJustifyH("LEFT")
-        fs:SetJustifyV("MIDDLE")
+        row.fs:ClearAllPoints()
+        row.fs:SetFont("Fonts\\FRIZQT__.TTF",fontSize,"")
+        row.fs:SetPoint("LEFT",  row,"LEFT",  6, 0)
+        row.fs:SetPoint("RIGHT", row,"RIGHT", -(iconSzSm + 8), 0)
+        row.fs:SetHeight(rowH2)
         if isMine then
-            fs:SetTextColor(cr, cg, cb)
+            row.fs:SetTextColor(cr, cg, cb)
+            row.fs:SetText(dname)
         elseif takenBy then
-            fs:SetTextColor(0.4,0.4,0.4)
-            fs:SetText(dname.." |cff666666("..takenBy..")|r")
+            row.fs:SetTextColor(0.4,0.4,0.4)
+            row.fs:SetText(dname.." |cff666666("..takenBy..")|r")
         else
-            fs:SetTextColor(0.9,0.85,0.75)
+            row.fs:SetTextColor(0.9,0.85,0.75)
+            row.fs:SetText(dname)
         end
-        if not takenBy then fs:SetText(dname) end
-
-        -- Status indicator: colored square (right side)
-        local icF = CreateFrame("Frame",nil,row)
-        icF:SetWidth(iconSzSm) icF:SetHeight(iconSzSm)
-        icF:SetPoint("RIGHT",row,"RIGHT",-4,0)
-        local icT = icF:CreateTexture(nil,"OVERLAY")
-        icT:SetAllPoints(icF)
-        icT:SetTexture("Interface\\Buttons\\WHITE8X8")
-        if isMine then
-            icT:SetVertexColor(1, 0.85, 0)      -- yellow: claimed by me
-        elseif takenBy then
-            icT:SetVertexColor(1, 0.2, 0.2)     -- red: claimed by other druid
-        else
-            icT:SetVertexColor(0.2, 1, 0.2)     -- green: free
-        end
-
-        -- Click: claim target (no unclaim on second click - use ESC to drop target)
+        row.icF:SetWidth(iconSzSm) row.icF:SetHeight(iconSzSm)
+        row.icF:ClearAllPoints()
+        row.icF:SetPoint("RIGHT",row,"RIGHT",-4,0)
+        if isMine then row.icT:SetVertexColor(1, 0.85, 0)
+        elseif takenBy then row.icT:SetVertexColor(1, 0.2, 0.2)
+        else row.icT:SetVertexColor(0.2, 1, 0.2) end
         if not takenBy and not isMine and brCDRem <= 0 then
             local capName = dname
             row:SetScript("OnClick",function()
@@ -2087,10 +2330,11 @@ local function UpdateDruidAssignFrame()
                 BR_BroadcastTarget(myName2, capName)
                 UpdateDruidAssignFrame()
             end)
+        else
+            row:SetScript("OnClick",nil)
         end
-
+        row:Show()
         curY = curY - rowH2 - 3
-        table.insert(druidAssignFrame._brDeadBtns, row)
     end
 
     -- Gap before cast button
@@ -2102,6 +2346,8 @@ local function UpdateDruidAssignFrame()
     brBtn:SetPoint("TOP",druidAssignFrame,"TOP",0,curY - 2)
     local brBtnW = math.max(80, fontSize * 6)
     brBtn:SetWidth(brBtnW) brBtn:SetHeight(BTN_H)
+    local brBtnText2 = getglobal("HealAssignDruidBRBtnText")
+    if brBtnText2 then brBtnText2:SetFont("Fonts\\FRIZQT__.TTF", fontSize, "") end
     brBtn:Show()
     local hasTarget = brTargeted[myName2] ~= nil
     if hasTarget and brCDRem <= 0 then
@@ -2218,7 +2464,7 @@ local function UpdateRLFrame()
             fsH:SetJustifyH("LEFT")
             fsH:SetJustifyV("MIDDLE")
             fsH:SetTextColor(hr2,hg2,hb2)
-            fsH:SetText(isDead and (hname.." [dead]") or hname)
+            fsH:SetText(hname)
             if hi < numRows then
                 local hsep = block:CreateTexture(nil,"ARTWORK")
                 hsep:SetHeight(1)
@@ -2666,6 +2912,14 @@ local function CleanRosterFromCurrentRaid()
             end
         end
         tmpl.healers = newHealers
+    end
+    -- Remove innervate assignments if the druid or healer has left the raid
+    if tmpl.innervate then
+        for dname,hname in pairs(tmpl.innervate) do
+            if not currentMembers[dname] or not currentMembers[hname] then
+                tmpl.innervate[dname] = nil
+            end
+        end
     end
 end
 
@@ -3175,8 +3429,35 @@ end
 
 -------------------------------------------------------------------------------
 -- MINIMAP BUTTON
--- Фрейм создаётся через HealAssign.xml (по образцу ItemRack)
+-- Frame is created via HealAssign.xml (following ItemRack pattern)
 -------------------------------------------------------------------------------
+-- Open mainFrame with rights check and HA_OPEN broadcast
+local function HA_OpenMainFrame()
+    if not HasEditorRights() then
+        DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Only Raid Leader or Assistant can open the editor.")
+        return
+    end
+    -- Warn if someone else has it open (auto-expire after 5 min)
+    if HA_editorOpenBy and HA_editorOpenTime and (GetTime() - HA_editorOpenTime) < 300 then
+        DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Editor is open at |cffffd700"..HA_editorOpenBy.."|r!")
+    end
+    -- Broadcast that we opened it
+    local chan = GetNumRaidMembers() > 0 and "RAID" or (GetNumPartyMembers() > 0 and "PARTY" or nil)
+    if chan then
+        pcall(SendAddonMessage, COMM_PREFIX, "HA_OPEN;"..UnitName("player"), chan)
+    end
+    if _CreateMainFrame then _CreateMainFrame() end
+end
+
+-- Close mainFrame and broadcast HA_CLOSE
+local function HA_CloseMainFrame()
+    if mainFrame then mainFrame:Hide() end
+    local chan = GetNumRaidMembers() > 0 and "RAID" or (GetNumPartyMembers() > 0 and "PARTY" or nil)
+    if chan then
+        pcall(SendAddonMessage, COMM_PREFIX, "HA_CLOSE", chan)
+    end
+end
+
 local function CreateMinimapButton()
     if not HealAssignMinimapBtn then return end
 
@@ -3192,11 +3473,20 @@ local function CreateMinimapButton()
     HealAssignMinimapBtn:Show()
 
     -- Click: toggle main window
+    HealAssignMinimapBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     HealAssignMinimapBtn:SetScript("OnClick", function()
-        if mainFrame and mainFrame:IsShown() then
-            mainFrame:Hide()
+        if arg1 == "RightButton" then
+            if optionsFrame and optionsFrame:IsShown() then
+                optionsFrame:Hide()
+            else
+                HealAssign_OpenOptions()
+            end
         else
-            if _CreateMainFrame then _CreateMainFrame() end
+            if mainFrame and mainFrame:IsShown() then
+                HA_CloseMainFrame()
+            else
+                HA_OpenMainFrame()
+            end
         end
     end)
 
@@ -3204,7 +3494,8 @@ local function CreateMinimapButton()
     HealAssignMinimapBtn:SetScript("OnEnter", function()
         GameTooltip:SetOwner(this, "ANCHOR_LEFT")
         GameTooltip:SetText("HealAssign v"..ADDON_VERSION)
-        GameTooltip:AddLine("Click to toggle main window", 1, 1, 1)
+        GameTooltip:AddLine("Left click: toggle main window", 1, 1, 1)
+        GameTooltip:AddLine("Right click: options", 1, 1, 1)
         GameTooltip:Show()
     end)
     HealAssignMinimapBtn:SetScript("OnLeave", function()
@@ -3487,6 +3778,26 @@ local function HandleAddonMessage(prefix,msg,channel,sender)
     local myName = UnitName("player")
     if sender == myName then return end
 
+    -- Editor open/close broadcast
+    local _,_,openName = string.find(msg,"^HA_OPEN;(.+)$")
+    if openName then
+        HA_editorOpenBy   = openName
+        HA_editorOpenTime = GetTime()
+        -- Warn if we also have mainFrame open
+        if mainFrame and mainFrame:IsShown() then
+            DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Editor also opened by |cffffd700"..openName.."|r - avoid simultaneous editing!")
+        end
+        return
+    end
+
+    if msg == "HA_CLOSE" then
+        if HA_editorOpenBy == sender then
+            HA_editorOpenBy   = nil
+            HA_editorOpenTime = nil
+        end
+        return
+    end
+
     -- Innervate cast broadcast: INN_CAST;druidName
     local _,_,innCaster = string.find(msg,"^INN_CAST;(.+)$")
     if innCaster then
@@ -3614,14 +3925,27 @@ deathFrame:RegisterEvent("CHAT_MSG_COMBAT_FRIENDLYPLAYER_DEATH")
 deathFrame:RegisterEvent("CHAT_MSG_COMBAT_FRIENDLY_DEATH")
 deathFrame:RegisterEvent("CHAT_MSG_SYSTEM")
 deathFrame:RegisterEvent("UNIT_HEALTH")
+-- Debounce for UNIT_HEALTH: do not update frames more than once per 2 seconds
+-- for the same dead player (event fires repeatedly)
+local unitHealthLastProcessed = {}
 deathFrame:SetScript("OnEvent",function()
     -- UNIT_HEALTH: catch death when health hits 0
     if event == "UNIT_HEALTH" then
         local unit = arg1
         if not unit then return end
-        if not UnitIsDeadOrGhost(unit) then return end
+        if not UnitIsDeadOrGhost(unit) then
+            -- Player is alive again - reset cache so next death triggers correctly
+            local aliveName = UnitName(unit)
+            if aliveName then unitHealthLastProcessed[aliveName] = nil end
+            return
+        end
         local deadName = UnitName(unit)
         if not deadName then return end
+        -- Debounce: skip repeated triggers within 2 seconds
+        local now = GetTime()
+        if unitHealthLastProcessed[deadName] and
+           now - unitHealthLastProcessed[deadName] < 2 then return end
+        unitHealthLastProcessed[deadName] = now
         local tmpl2 = GetActiveTemplate()
         if not tmpl2 or not tmpl2.roster then return end
         local pd = tmpl2.roster[deadName]
@@ -3822,13 +4146,19 @@ rezFrame:SetScript("OnEvent",function()
     end
 
     -- UNIT_HEALTH: if someone in brDeadList is now alive - remove them
+    -- Debounce: do not process the same player more than once per 2 seconds
     if event == "UNIT_HEALTH" then
         local unit = arg1
         if unit and not UnitIsDeadOrGhost(unit) then
             local aliveName = UnitName(unit)
             if aliveName then
+                -- Debounce
+                local now2 = GetTime()
+                if unitHealthLastProcessed[aliveName] and
+                   now2 - unitHealthLastProcessed[aliveName] < 2 then return end
                 for _,d in ipairs(brDeadList) do
                     if d.name == aliveName then
+                        unitHealthLastProcessed[aliveName] = now2
                         BR_RemoveDead(aliveName)
                         RemoveDeadHealer(aliveName)
                         UpdateDruidAssignFrame()
@@ -4079,30 +4409,23 @@ end
 -------------------------------------------------------------------------------
 -- INNERVATE ASSIGNMENT WINDOW (RL only: assign druids to healers)
 -------------------------------------------------------------------------------
-local innRows = {}
+local innRows = {}  -- row pool: {cell, dLabel, hLabel, ddBtn}
 
 local function INN_RebuildAssignRows()
     if not innervateFrame then return end
-    for _,r in ipairs(innRows) do r:Hide() end
-    innRows = {}
 
     local tmpl = GetActiveTemplate()
-    if not tmpl then return end
     local druids  = INN_GetDruids()
-    local healers = INN_GetHealers()
+    local healers = tmpl and INN_GetHealers() or {}
 
-    local y    = -44
-    local rowH = 26
-    local cellW2 = 270
+    local rowH    = 26
+    local cellW2  = 270
 
-    for _,dname in ipairs(druids) do
-        local assigned = tmpl.innervate and tmpl.innervate[dname]
-
-        -- Cell frame - same style as healer cell in main grid
+    -- Expand pool if needed
+    while table.getn(innRows) < table.getn(druids) + 1 do
         local cell2 = CreateFrame("Frame",nil,innervateFrame)
         cell2:SetWidth(cellW2)
         cell2:SetHeight(rowH)
-        cell2:SetPoint("TOPLEFT",innervateFrame,"TOPLEFT",10,y)
         cell2:SetBackdrop({
             bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
             edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
@@ -4111,85 +4434,105 @@ local function INN_RebuildAssignRows()
         })
         cell2:SetBackdropColor(0.07,0.07,0.14,0.97)
         cell2:SetBackdropBorderColor(0.25,0.35,0.6,0.8)
-        table.insert(innRows, cell2)
-
-        -- Druid name
+        cell2:Hide()
         local dr,dg,db = GetClassColor("DRUID")
         local dLabel = cell2:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
         dLabel:SetPoint("LEFT",cell2,"LEFT",6,0)
         dLabel:SetWidth(100)
         dLabel:SetJustifyH("LEFT")
         dLabel:SetTextColor(dr,dg,db)
-        dLabel:SetText(dname)
-
-        -- Healer name label (appears after selection)
         local hLabel = cell2:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
         hLabel:SetPoint("LEFT",cell2,"LEFT",112,0)
         hLabel:SetWidth(90)
         hLabel:SetJustifyH("LEFT")
-        if assigned then
-            local hr,hg,hb = 1,1,1
-            if tmpl.roster and tmpl.roster[assigned] then
-                hr,hg,hb = GetClassColor(tmpl.roster[assigned].class)
-            end
-            hLabel:SetTextColor(hr,hg,hb)
-            hLabel:SetText(assigned)
-        else
-            hLabel:SetTextColor(0.4,0.4,0.4)
-            hLabel:SetText("---")
-        end
-
-        -- FIX 3: standard addon button style (UIPanelButtonTemplate like all other buttons)
         local ddBtn = CreateFrame("Button",nil,cell2,"UIPanelButtonTemplate")
         ddBtn:SetWidth(50)
         ddBtn:SetHeight(16)
         ddBtn:SetPoint("RIGHT",cell2,"RIGHT",-4,0)
         ddBtn:SetText("Assign")
-        local capturedDruid = dname
-        ddBtn:SetScript("OnClick",function()
-            local items = {}
-            table.insert(items,{text="(clear)",r=0.5,g=0.5,b=0.5,clear=true})
-            for _,hname in ipairs(healers) do
-                local pr,pg,pb = 1,1,1
-                if tmpl.roster and tmpl.roster[hname] then
-                    pr,pg,pb = GetClassColor(tmpl.roster[hname].class)
-                end
-                table.insert(items,{text=hname,r=pr,g=pg,b=pb,hname=hname})
-            end
-            if table.getn(items)==1 then
-                table.insert(items,{text="(no healers tagged H)",r=0.5,g=0.5,b=0.5})
-            end
-            ShowDropdown(this, items, function(item)
-                if not tmpl.innervate then tmpl.innervate = {} end
-                if item.clear then
-                    tmpl.innervate[capturedDruid] = nil
-                elseif item.hname then
-                    tmpl.innervate[capturedDruid] = item.hname
-                end
-                            PersistTemplate()
-                INN_BroadcastAssignments()
-                INN_RebuildAssignRows()
-                UpdateAssignFrame() UpdateViewerFrame()
-                UpdateDruidAssignFrame()
-            end, 140)
-        end)
-        table.insert(innRows, ddBtn)
-
-        y = y - rowH - 4
+        cell2.dLabel = dLabel
+        cell2.hLabel = hLabel
+        cell2.ddBtn  = ddBtn
+        -- "no druids" row (reuse first pool slot)
+        table.insert(innRows, cell2)
     end
 
+    -- Hide all pool rows
+    for _,r in ipairs(innRows) do r:Hide() end
+
+    local y = -44
+
     if table.getn(druids) == 0 then
-        local noRow = CreateFrame("Frame",nil,innervateFrame)
+        local noRow = innRows[1]
+        noRow:ClearAllPoints()
         noRow:SetPoint("TOPLEFT",innervateFrame,"TOPLEFT",10,-44)
-        noRow:SetWidth(270)
-        noRow:SetHeight(20)
-        local noLabel = noRow:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
-        noLabel:SetAllPoints(noRow)
-        noLabel:SetJustifyH("LEFT")
-        noLabel:SetTextColor(0.5,0.5,0.5)
-        noLabel:SetText("  No non-healer druids in roster.")
-        table.insert(innRows, noRow)
+        noRow:SetWidth(270) noRow:SetHeight(20)
+        -- "no druids" text stored in dLabel
+        noRow.dLabel:SetTextColor(0.5,0.5,0.5)
+        noRow.dLabel:SetText("  No non-healer druids in roster.")
+        noRow.dLabel:SetWidth(260)
+        noRow.hLabel:SetText("")
+        noRow.ddBtn:Hide()
+        noRow:Show()
         y = y - rowH
+    else
+        for i,dname in ipairs(druids) do
+            local cell2 = innRows[i]
+            local assigned = tmpl and tmpl.innervate and tmpl.innervate[dname]
+            cell2:ClearAllPoints()
+            cell2:SetPoint("TOPLEFT",innervateFrame,"TOPLEFT",10,y)
+            -- Druid name
+            local dr,dg,db = GetClassColor("DRUID")
+            cell2.dLabel:SetTextColor(dr,dg,db)
+            cell2.dLabel:SetText(dname)
+            cell2.dLabel:SetWidth(100)
+            -- Healer name
+            if assigned then
+                local hr,hg,hb = 1,1,1
+                if tmpl and tmpl.roster and tmpl.roster[assigned] then
+                    hr,hg,hb = GetClassColor(tmpl.roster[assigned].class)
+                end
+                cell2.hLabel:SetTextColor(hr,hg,hb)
+                cell2.hLabel:SetText(assigned)
+            else
+                cell2.hLabel:SetTextColor(0.4,0.4,0.4)
+                cell2.hLabel:SetText("---")
+            end
+            -- Assign button - reassign OnClick with current closure
+            cell2.ddBtn:Show()
+            local capturedDruid = dname
+            cell2.ddBtn:SetScript("OnClick",function()
+                local t2 = GetActiveTemplate()
+                if not t2 then return end
+                local items = {}
+                table.insert(items,{text="(clear)",r=0.5,g=0.5,b=0.5,clear=true})
+                for _,hname in ipairs(INN_GetHealers()) do
+                    local pr,pg,pb = 1,1,1
+                    if t2.roster and t2.roster[hname] then
+                        pr,pg,pb = GetClassColor(t2.roster[hname].class)
+                    end
+                    table.insert(items,{text=hname,r=pr,g=pg,b=pb,hname=hname})
+                end
+                if table.getn(items)==1 then
+                    table.insert(items,{text="(no healers tagged H)",r=0.5,g=0.5,b=0.5})
+                end
+                ShowDropdown(this, items, function(item)
+                    if not t2.innervate then t2.innervate = {} end
+                    if item.clear then
+                        t2.innervate[capturedDruid] = nil
+                    elseif item.hname then
+                        t2.innervate[capturedDruid] = item.hname
+                    end
+                    PersistTemplate()
+                    INN_BroadcastAssignments()
+                    INN_RebuildAssignRows()
+                    UpdateAssignFrame() UpdateViewerFrame()
+                    UpdateDruidAssignFrame()
+                end, 140)
+            end)
+            cell2:Show()
+            y = y - rowH - 4
+        end
     end
 
     local totalH = math.abs(y) + 20
@@ -4348,10 +4691,8 @@ innTicker:SetScript("OnUpdate",function()
             UpdateViewerFrame()
         end
     end
-    -- Update innervate assignment window if open
-    if innervateFrame and innervateFrame:IsShown() then
-        INN_RebuildAssignRows()
-    end
+    -- innervateFrame is updated only on data change (via INN_RebuildAssignRows),
+    -- not every second - removed to eliminate memory leak
 end)
 
 
@@ -4391,26 +4732,12 @@ SlashCmdList["HEALASSIGN"] = function(msg)
         DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/ha help|r       - This help")
 
     else
-        if not HasEditorRights() then
-            DEFAULT_CHAT_FRAME:AddMessage("|cffff4444HealAssign:|r Only Raid Leader or Assistant can open the editor.")
-            return
-        end
-        if mainFrame then
-            if mainFrame:IsShown() then
-                mainFrame:Hide()
-                CloseDropdown()
-                if rosterFrame then rosterFrame:Hide() end
-            else
-                mainFrame:Show()
-                mainFrame:Raise()
-                if mainFrame.nameEdit and currentTemplate then
-                    mainFrame.nameEdit:SetText(currentTemplate.name or "")
-                end
-                RebuildMainGrid()
-                PushWindow(mainFrame)
-            end
+        if mainFrame and mainFrame:IsShown() then
+            HA_CloseMainFrame()
+            CloseDropdown()
+            if rosterFrame then rosterFrame:Hide() end
         else
-            CreateMainFrame()
+            HA_OpenMainFrame()
         end
     end
 

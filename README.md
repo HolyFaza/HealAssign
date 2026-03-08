@@ -1,4 +1,4 @@
-# HealAssign v2.0.4
+# HealAssign v2.0.5
 
 A healer assignment addon for **World of Warcraft 1.12.1 (Vanilla / Turtle WoW)**.
 
@@ -75,10 +75,12 @@ Designed for raid leaders and healers to manage and display healing assignments 
 
 | Command | Description |
 |---|---|
-| `/ha` | Open the main window |
+| `/ha` | Toggle the main window (RL/Assistant only) |
 | `/ha sync` | Broadcast current template to raid |
-| `/ha options` | Open options |
+| `/ha options` | Toggle options |
 | `/ha assign` | Toggle the assignment window |
+| `/ha rl` | Toggle raid leader view |
+| `/ha help` | Show all commands |
 
 ---
 
@@ -100,9 +102,27 @@ Designed for raid leaders and healers to manage and display healing assignments 
 
 ## Changelog
 
+### v2.0.5
+- **Performance refactor** — widget pool system for all dynamic frames (viewer, healer assignment, druid assignment, innervate rows); eliminates per-frame creation on every update tick; UNIT_HEALTH event debounced (2 s per unit) to prevent raid-wide lag spikes
+- **Adaptive window widths** — all assignment windows (viewer, healer, druid) now size dynamically to fit the longest name at the current font size; no more excess whitespace
+- **Collapsible Rebirth section** — Rebirth block in the viewer window can be collapsed/expanded with a +/− toggle button
+- **Options moved to minimap** — Options buttons removed from all windows; right-click the minimap icon to open Options (left-click still toggles the main window); Options are accessible at all times, including outside raid
+- **Access control** — only Raid Leader or Assistant can open the main editor window; other players see a chat message explaining the restriction
+- **Concurrent editor warning** — if a second RL/Assistant opens the editor while another player already has it open, both receive a warning in chat; lock auto-expires after 5 minutes in case of disconnect
+- **Fixed:** Innervate cooldown was resetting for all druids when any one druid cast Innervate
+- **Fixed:** Viewer window was showing players who had left the raid
+- **Fixed:** Stale Innervate assignment remained visible in viewer after druid or healer left the raid
+- **Fixed:** Innervate block was incorrectly hidden in the healer assignment window
+- **Fixed:** Innervate cooldown showed "0:00" instead of disappearing when ready
+- **Fixed:** Dead healer was incorrectly marked as alive ~15 seconds after death
+- **Fixed:** [DEAD] and [!] text labels replaced with red name colouring throughout all windows
+- **Fixed:** Healer name overlapped the Options button in the druid assignment frame
+- **Fixed:** Window title overlapped the Options button in the healer assignment frame
+- **Fixed:** Button font now scales correctly with the font size slider
+
 ### v2.0.4
 - **Rebirth system** — all druids receive a window with a live list of dead T/H-tagged raid members; click a name to target, then cast Rebirth via the cast button; target status is synced across all druids in real time (green = free, yellow = your target, red = taken); 30-minute cooldown timer shown on the icon; healer-druids see Rebirth integrated into their assignment window
-- **Minimap icon** — addon now shows a draggable icon on the minimap; click to toggle the main window; drag to reposition
+- **Minimap icon** — draggable icon on the minimap; left-click to toggle the main window; right-click to toggle options; drag to reposition
 - **Hide in Battlegrounds** — new checkbox in Options; when enabled (default), the addon is hidden in battlegrounds
 
 ### v2.0.3
