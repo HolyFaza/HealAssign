@@ -1,4 +1,4 @@
-# HealAssign v2.0.5
+# HealAssign v2.0.6
 
 A healer assignment addon for **World of Warcraft 1.12.1 (Vanilla / Turtle WoW)**.
 
