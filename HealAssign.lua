@@ -6,7 +6,7 @@
 -- CONSTANTS
 -------------------------------------------------------------------------------
 local ADDON_NAME    = "HealAssign"
-local ADDON_VERSION = "2.0.4"
+local ADDON_VERSION = "2.0.6"
 local COMM_PREFIX   = "HealAssign"
 local HA_editorOpenBy   = nil   -- name of player who has mainFrame open
 local HA_editorOpenTime = nil   -- GetTime() when HA_OPEN was received
@@ -126,6 +126,7 @@ local _UpdateAssignFrame     = nil
 local _CreateMainFrame       = nil
 local _SyncHealersFromRoster = nil
 local _RebuildRosterRows     = nil
+local _UpdateDruidAssignFrame = nil
 
 local function _DoNewTemplate()
     local newTmpl = NewTemplate("")
@@ -258,9 +259,9 @@ end
 -------------------------------------------------------------------------------
 -- TEMPLATE STATE
 -------------------------------------------------------------------------------
-currentTemplate  = nil
-HA_wasInRaid     = false  -- true only after first RAID_ROSTER_UPDATE(inRaid=true) this session
-HA_reloadProtect = true   -- true on fresh load, blocks roster clear until raid confirmed
+local currentTemplate  = nil
+local HA_wasInRaid     = false  -- true only after first RAID_ROSTER_UPDATE(inRaid=true) this session
+local HA_reloadProtect = true   -- true on fresh load, blocks roster clear until raid confirmed
 
 -- Ensure currentTemplate is always persisted in HealAssignDB
 local function PersistTemplate()
